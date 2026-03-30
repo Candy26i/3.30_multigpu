@@ -1,0 +1,23 @@
+[project]
+name = "grpo-training"
+version = "0.1.0"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+ # "transformers==5.0.0rc3",
+  #"trl==0.26.2",
+  "accelerate==1.12.0",
+  "datasets==4.4.2",
+  "peft",
+  "wandb==0.23.1",
+  "sentencepiece==0.2.1",
+  "safetensors==0.7.0",
+  "huggingface-hub==1.3.2",
+  "numpy==2.2.6",
+  "scipy==1.15.3",
+  "pandas==2.3.3",
+  "pyarrow==22.0.0",
+  "protobuf==6.33.2",
+  "packaging==25.0",
+  "tqdm==4.67.1",
+  "pyyaml==6.0.3",
+]
