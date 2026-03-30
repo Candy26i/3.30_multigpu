@@ -3,18 +3,31 @@
 
 import argparse
 import glob
+import importlib
+import inspect
 import json
 import os
 import random
 import re
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset
+
+DATASETS_AVAILABLE = False
+DATASETS_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from datasets import Dataset, load_dataset
+    DATASETS_AVAILABLE = True
+except Exception as _datasets_import_error:
+    Dataset = Any
+    load_dataset = None
+    DATASETS_IMPORT_ERROR = _datasets_import_error
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -23,8 +36,19 @@ from transformers import (
     DataCollatorForSeq2Seq,
 )
 
-from trl import GRPOConfig, GRPOTrainer
-from trl.chat_template_utils import add_response_schema
+TRL_AVAILABLE = False
+TRL_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from trl import GRPOConfig, GRPOTrainer
+    from trl.chat_template_utils import add_response_schema
+    TRL_AVAILABLE = True
+except Exception as _trl_import_error:
+    GRPOConfig = None
+    GRPOTrainer = None
+    TRL_IMPORT_ERROR = _trl_import_error
+
+    def add_response_schema(tokenizer: Any) -> Any:
+        return tokenizer
 
 # Optional LoRA
 try:
@@ -32,6 +56,157 @@ try:
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
+
+
+def require_trl(stage_name: str) -> None:
+    if TRL_AVAILABLE:
+        return
+    detail = "" if TRL_IMPORT_ERROR is None else f" Original import error: {type(TRL_IMPORT_ERROR).__name__}: {TRL_IMPORT_ERROR}"
+    raise RuntimeError(
+        f"{stage_name} requires `trl`, but it is not installed in the current Python environment.{detail}"
+    )
+
+
+def require_datasets(stage_name: str) -> None:
+    if DATASETS_AVAILABLE:
+        return
+    detail = (
+        ""
+        if DATASETS_IMPORT_ERROR is None
+        else f" Original import error: {type(DATASETS_IMPORT_ERROR).__name__}: {DATASETS_IMPORT_ERROR}"
+    )
+    raise RuntimeError(
+        f"{stage_name} requires `datasets`, but it is not installed in the current Python environment.{detail}"
+    )
+
+
+def get_local_rank() -> int:
+    try:
+        return int(os.environ.get("LOCAL_RANK", "-1"))
+    except Exception:
+        return -1
+
+
+def get_global_rank() -> int:
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except Exception:
+        return 0
+
+
+def get_world_size() -> int:
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1"))
+    except Exception:
+        return 1
+
+
+def configure_cuda_runtime() -> None:
+    local_rank = get_local_rank()
+    if torch.cuda.is_available() and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
+
+
+def get_runtime_device() -> str:
+    if not torch.cuda.is_available():
+        return "cpu"
+    local_rank = get_local_rank()
+    if local_rank >= 0:
+        return f"cuda:{local_rank}"
+    return "cuda"
+
+
+def get_runtime_dtype() -> torch.dtype:
+    return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+
+def _import_optional_module(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+def _signature_parameter_names(callable_obj: Any) -> Optional[set]:
+    try:
+        return set(inspect.signature(callable_obj).parameters.keys())
+    except Exception:
+        return None
+
+
+def _filter_supported_kwargs(callable_obj: Any, kwargs: Dict[str, Any], label: str) -> Dict[str, Any]:
+    supported = _signature_parameter_names(callable_obj)
+    if supported is None:
+        return dict(kwargs)
+    filtered = {k: v for k, v in kwargs.items() if k in supported}
+    dropped = sorted([k for k in kwargs.keys() if k not in filtered])
+    if dropped:
+        print(f"[{label}] skipped unsupported kwargs: {', '.join(dropped)}")
+    return filtered
+
+
+def _grpo_supports_environment_factory() -> bool:
+    if not TRL_AVAILABLE:
+        return False
+    supported = _signature_parameter_names(GRPOTrainer.__init__)
+    return bool(supported and "environment_factory" in supported)
+
+
+def _trainer_processing_kwargs(processing_obj: Any) -> Dict[str, Any]:
+    if not TRL_AVAILABLE:
+        return {}
+    supported = _signature_parameter_names(GRPOTrainer.__init__) or set()
+    if "processing_class" in supported:
+        return {"processing_class": processing_obj}
+    if "tokenizer" in supported:
+        return {"tokenizer": processing_obj}
+    return {}
+
+
+def _platform_label() -> str:
+    return f"{os.name}:{sys.platform}"
+
+
+def _build_vllm_server_launch_hint(
+    model_name: str,
+    server_base_url: str,
+    visible_devices: str,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+) -> str:
+    parsed = urlparse(server_base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8000
+    prefix = f"CUDA_VISIBLE_DEVICES={visible_devices} " if visible_devices.strip() else ""
+    return (
+        f"{prefix}trl vllm-serve --model {model_name} "
+        f"--tensor-parallel-size {max(1, int(tensor_parallel_size))} "
+        f"--host {host} --port {port} "
+        f"--gpu-memory-utilization {float(gpu_memory_utilization):.2f}"
+    )
+
+
+def validate_distributed_runtime(stage_name: str, require_cuda: bool = False, use_vllm: bool = False) -> None:
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{stage_name} requires CUDA, but torch.cuda is unavailable in the current Python environment. "
+            "This usually means you installed a CPU-only PyTorch build."
+        )
+    if get_world_size() > 1 and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{stage_name} detected WORLD_SIZE={get_world_size()} but torch.cuda is unavailable. "
+            "Multi-GPU training requires a CUDA-enabled PyTorch install."
+        )
+    if use_vllm:
+        if os.name == "nt":
+            raise RuntimeError(
+                "vLLM is not supported in this native Windows runtime. "
+                "Run this script under Linux or WSL2 with a CUDA-enabled PyTorch environment."
+            )
+        if _import_optional_module("vllm") is None:
+            raise RuntimeError(
+                f"{stage_name} requested vLLM, but `vllm` is not importable in the current environment."
+            )
 
 
 # =========================================================
@@ -990,23 +1165,30 @@ def build_tool_sft_data_from_splits(
 def tokenize_sft_dataset(ds: Dataset, tokenizer: Any, max_seq_len: int) -> Dataset:
     eos = tokenizer.eos_token or ""
 
+    def _normalize_response_messages(response: Any) -> List[Dict[str, Any]]:
+        if isinstance(response, str):
+            return [{"role": "assistant", "content": response}]
+        if isinstance(response, dict):
+            msg = dict(response)
+            msg.setdefault("role", "assistant")
+            return [msg]
+        if isinstance(response, list):
+            out = []
+            for item in response:
+                if not isinstance(item, dict):
+                    raise ValueError(f"Unsupported response message type: {type(item)}")
+                msg = dict(item)
+                msg.setdefault("role", "assistant")
+                out.append(msg)
+            return out
+        raise ValueError(f"Unsupported response type for SFT tokenization: {type(response)}")
+
     def _map(ex: Dict[str, Any]) -> Dict[str, Any]:
         prompt_msgs = ex["prompt"]
-        response = ex["response"]
+        response_msgs = _normalize_response_messages(ex["response"])
 
-        try:
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-        except TypeError:
-            prompt_text = tokenizer.apply_chat_template(prompt_msgs, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            parts = []
-            for m in prompt_msgs:
-                parts.append(f"{m.get('role','')}: {m.get('content','')}")
-            prompt_text = "\n".join(parts) + "\nassistant: "
-
-        full_text = prompt_text + response + eos
+        prompt_text = render_chat_messages(tokenizer, prompt_msgs, add_generation_prompt=True)
+        full_text = render_chat_messages(tokenizer, prompt_msgs + response_msgs, add_generation_prompt=False) + eos
 
         prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         full = tokenizer(full_text, add_special_tokens=False)
@@ -1044,20 +1226,22 @@ def train_sft_agent(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
 ):
+    require_datasets("train_sft_agent")
     set_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_runtime_device()
+    validate_distributed_runtime("train_sft_agent", require_cuda=(get_world_size() > 1))
 
     tok = AutoTokenizer.from_pretrained(tool_base_model, trust_remote_code=True)
     tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
 
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    dtype = get_runtime_dtype()
     model = AutoModelForCausalLM.from_pretrained(
         tool_base_model,
         torch_dtype=dtype,
         trust_remote_code=True,
-    ).to(device)
+    )
     model.config.use_cache = False
 
     if use_lora:
@@ -1096,7 +1280,7 @@ def train_sft_agent(
         num_train_epochs=epochs,
         logging_steps=10,
         save_strategy="epoch",
-        bf16=(device == "cuda"),
+        bf16=torch.cuda.is_available(),
         fp16=False,
         report_to=[],
         seed=seed,
@@ -1122,6 +1306,89 @@ def train_sft_agent(
 # =========================================================
 TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*.+?\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 TOOLS_TAG_RE = re.compile(r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL)
+TOOL_CALLS_FIELD_RE = re.compile(r'"tool_calls"\s*:', re.IGNORECASE)
+TOOL_JSON_RE = re.compile(
+    r'"name"\s*:\s*"(reasoning_tool|context_tool)".*?"arguments"\s*:',
+    re.IGNORECASE | re.DOTALL,
+)
+PLAIN_TOOL_NAME_RE = re.compile(
+    r"^\s*(reasoning_tool|context_tool)\s*(?:\(|\{|:|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+MANAGER_TOOL_BINDING_MODE = "argument"  # argument | environment
+
+
+def _manager_tools_require_example_id() -> bool:
+    return MANAGER_TOOL_BINDING_MODE != "environment"
+
+
+def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(dumps_json(item) if isinstance(item, (dict, list)) else str(item))
+        return "\n".join([p for p in parts if p])
+    if isinstance(content, dict):
+        return dumps_json(content)
+    return str(content)
+
+
+def _fallback_render_messages(messages: List[Dict[str, Any]], add_generation_prompt: bool) -> str:
+    parts = []
+    for m in messages:
+        role = str(m.get("role", "")).strip() or "user"
+        if role == "assistant" and isinstance(m.get("tool_calls"), list):
+            for tc in m.get("tool_calls", []):
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                tool_name = str(fn.get("name", "")).strip()
+                arguments = fn.get("arguments", "{}")
+                payload = {"name": tool_name, "arguments": arguments}
+                parts.append(f"assistant_tool_call: {dumps_json(payload)}")
+            content = _message_content_to_text(m.get("content"))
+            if content:
+                parts.append(f"assistant: {content}")
+            continue
+        if role == "tool":
+            tool_name = str(m.get("name", "tool")).strip() or "tool"
+            tool_call_id = str(m.get("tool_call_id", "")).strip()
+            prefix = f"tool[{tool_name}]"
+            if tool_call_id:
+                prefix += f"#{tool_call_id}"
+            parts.append(f"{prefix}: {_message_content_to_text(m.get('content'))}")
+            continue
+        parts.append(f"{role}: {_message_content_to_text(m.get('content'))}")
+    if add_generation_prompt:
+        parts.append("assistant: ")
+    return "\n".join(parts)
+
+
+def render_chat_messages(tokenizer: Any, messages: List[Dict[str, Any]], add_generation_prompt: bool) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+        )
+    except TypeError:
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception:
+            return _fallback_render_messages(messages, add_generation_prompt=add_generation_prompt)
+    except Exception:
+        return _fallback_render_messages(messages, add_generation_prompt=add_generation_prompt)
 
 
 def parse_answer_label_lastline(text: str) -> Optional[str]:
@@ -1139,14 +1406,18 @@ def parse_answer_label_lastline(text: str) -> Optional[str]:
 
 
 def final_has_tool_call_artifacts(text: str) -> bool:
-    """
-    Only detect very certain patterns to avoid false positives.
-    """
     if not text:
         return False
-    if TOOL_CALL_TAG_RE.search(text):
+    txt = str(text)
+    if TOOL_CALL_TAG_RE.search(txt):
         return True
-    if TOOLS_TAG_RE.search(text):
+    if TOOLS_TAG_RE.search(txt):
+        return True
+    if TOOL_CALLS_FIELD_RE.search(txt):
+        return True
+    if TOOL_JSON_RE.search(txt):
+        return True
+    if PLAIN_TOOL_NAME_RE.search(txt):
         return True
     return False
 
@@ -1162,13 +1433,8 @@ def ensure_list(x: Any, n: int) -> List[Any]:
 
 
 def extract_stats(completion_msgs: Any) -> Dict[str, Any]:
-    """
-    TRL may return:
-    - a list of messages (assistant/tool)
-    - or just a string
-    """
     if not isinstance(completion_msgs, list):
-        txt = "" if completion_msgs is None else str(completion_msgs)
+        txt = _message_content_to_text(completion_msgs)
         has_tool_text = final_has_tool_call_artifacts(txt)
         return {
             "assistant_texts": [txt],
@@ -1178,6 +1444,7 @@ def extract_stats(completion_msgs: Any) -> Dict[str, Any]:
             "tool_payloads": [],
             "last_assistant_text": txt,
             "last_assistant_has_tool_calls": False,
+            "last_assistant_plaintext_tool_artifacts": bool(has_tool_text),
             "fake_tool_text_attempt": bool(has_tool_text),
         }
 
@@ -1195,13 +1462,11 @@ def extract_stats(completion_msgs: Any) -> Dict[str, Any]:
     tool_payloads = []
     for m in tool_msgs:
         tool_names.append("" if m.get("name") is None else str(m.get("name")))
-        tool_payloads.append("" if m.get("content") is None else str(m.get("content")))
+        tool_payloads.append(_message_content_to_text(m.get("content")))
 
     assistant_texts = []
-    assistant_has_tool_calls = []
     for m in assistant_msgs:
-        assistant_texts.append("" if m.get("content") is None else str(m.get("content")))
-        assistant_has_tool_calls.append(bool(m.get("tool_calls")))
+        assistant_texts.append(_message_content_to_text(m.get("content")))
 
     last_assistant_text = assistant_texts[-1] if assistant_texts else ""
     last_assistant_has_tool_calls = bool(assistant_msgs[-1].get("tool_calls")) if assistant_msgs else False
@@ -1217,6 +1482,7 @@ def extract_stats(completion_msgs: Any) -> Dict[str, Any]:
         "tool_payloads": tool_payloads,
         "last_assistant_text": last_assistant_text,
         "last_assistant_has_tool_calls": last_assistant_has_tool_calls,
+        "last_assistant_plaintext_tool_artifacts": bool(final_has_tool_call_artifacts(last_assistant_text)),
         "fake_tool_text_attempt": fake_tool_text_attempt,
     }
 
@@ -1266,17 +1532,7 @@ class FrozenAgent:
 
     @torch.no_grad()
     def generate(self, messages: List[Dict[str, str]], temperature: float = 0.0) -> str:
-        try:
-            prompt = self.tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-        except TypeError:
-            prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            parts = []
-            for m in messages:
-                parts.append(f"{m.get('role','')}: {m.get('content','')}")
-            prompt = "\n".join(parts) + "\nassistant: "
+        prompt = render_chat_messages(self.tok, messages, add_generation_prompt=True)
 
         inputs = self.tok(prompt, return_tensors="pt").to(self.device)
         do_sample = (temperature > 1e-6)
@@ -1564,6 +1820,40 @@ def context_tool(example_id: int) -> str:
 # =========================================================
 # Manager prompt
 # =========================================================
+def _tool_call_args_for_current_mode(eid: int) -> Dict[str, Any]:
+    if _manager_tools_require_example_id():
+        return {"example_id": int(eid)}
+    return {}
+
+
+def _tool_call_message(tool_name: str, eid: int, call_id: str) -> Dict[str, Any]:
+    return {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": dumps_json(_tool_call_args_for_current_mode(eid)),
+                },
+            }
+        ],
+    }
+
+
+class ManagerToolEnvironment:
+    def reset(self, example_id: int, **kwargs) -> Optional[str]:
+        self.example_id = int(example_id)
+        return None
+
+    def reasoning_tool(self) -> str:
+        return reasoning_tool(getattr(self, "example_id", -1))
+
+    def context_tool(self) -> str:
+        return context_tool(getattr(self, "example_id", -1))
+
+
 def build_manager_system_prompt() -> str:
     if TASK_NAME == "medqa":
         task_line = "You are a manager agent solving medical multiple-choice questions."
@@ -1573,13 +1863,32 @@ def build_manager_system_prompt() -> str:
         task_line = "You are a manager agent solving clinical QA tasks."
 
     answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
+    if _manager_tools_require_example_id():
+        tool_binding_line = "The available native tools expect the current Example ID from the user message."
+        tool_arg_rule = "If you call a tool, pass the current Example ID exactly as shown in the user message."
+    else:
+        tool_binding_line = "The available native tools are already bound to the current example."
+        tool_arg_rule = "If you call a tool, do not invent arguments."
     return (
         task_line + "\n"
         "Calling tools is OPTIONAL.\n"
         "You have up to TWO tool calls total.\n"
-        "- Final answer must end with exactly one line:\n"
+        "Use the model's native tool-calling interface when you want to call a tool.\n"
+        "The available native tools are `reasoning_tool` and `context_tool`.\n"
+        f"{tool_binding_line}\n\n"
+        "Policy:\n"
+        "- Prefer answering directly when you are confident.\n"
+        "- If uncertain, call ONE tool first.\n"
+        "- Only call the second tool if you are still uncertain after the first tool.\n"
+        "- Do not write tool calls, XML tags, or tool-call JSON in plain text.\n"
+        f"- {tool_arg_rule}\n\n"
+        "Rules:\n"
+        "- If you call a tool, do NOT output the final ANSWER_* label in the same assistant turn.\n"
+        "- After receiving tool output, you may call another tool OR answer.\n"
+        "- Final answer may include brief reasoning, but it must end with exactly one line:\n"
         f"{answer_lines}\n"
         "Do not write anything after that last line.\n"
+        "Do NOT output <think>.\n"
     )
 
 
@@ -1598,25 +1907,21 @@ def _format_choices_block(choices: Optional[Dict[str, str]]) -> str:
 
 def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     choices_block = _format_choices_block(choices)
+    if _manager_tools_require_example_id():
+        tool_hint = "If you use a tool, call it with the current Example ID."
+    else:
+        tool_hint = "If you use a tool, call the current-example tool directly."
     return [
         {"role": "system", "content": MANAGER_SYSTEM},
         {
             "role": "user",
             "content": (
-                f"example_id: {eid}\n\n"
+                f"Example ID: {eid}\n\n"
                 f"Question:\n{q}\n\n"
                 f"{choices_block}"
                 f"Context:\n{ctx}\n\n"
-                "You may call reasoning_tool and/or context_tool.\n"
-                "If you call a tool, copy the exact example_id provided above into the arguments.\n"
-                "If you do NOT call tools, answer directly.\n\n"
-                "When calling a tool, output exactly in one or more blocks like these:\n"
-                "<tool_call>\n"
-                f'{{"name": "reasoning_tool", "arguments": {{"example_id": {eid}}}}}\n'
-                "</tool_call>\n\n"
-                "<tool_call>\n"
-                f'{{"name": "context_tool", "arguments": {{"example_id": {eid}}}}}\n'
-                "</tool_call>\n"
+                f"{tool_hint}\n"
+                "If you do NOT call tools, answer directly.\n"
             ),
         },
     ]
@@ -1652,7 +1957,7 @@ def binary_outcome_reward(prompts=None, completions=None, ground_truth=None, exa
         valid_format = (pred is not None)
 
         final_has_artifacts = bool(
-            st["last_assistant_has_tool_calls"] or final_has_tool_call_artifacts(st["last_assistant_text"])
+            st["last_assistant_has_tool_calls"] or st.get("last_assistant_plaintext_tool_artifacts")
         )
         fake_tool_text = bool(st.get("fake_tool_text_attempt"))
 
@@ -1701,10 +2006,6 @@ def binary_outcome_reward(prompts=None, completions=None, ground_truth=None, exa
 # =========================================================
 # Manager SFT from failures (teacher chooses tool sequence)
 # =========================================================
-def _tool_call_str(tool_name: str, eid: int) -> str:
-    return "<tool_call>\n" + dumps_json({"name": tool_name, "arguments": {"example_id": int(eid)}}) + "\n</tool_call>"
-
-
 def _final_answer_str(gt: str) -> str:
     canonical = _normalize_label(gt)
     if canonical not in ANSWER_CANONICAL_TO_TOKEN:
@@ -1716,6 +2017,7 @@ def teacher_choose_tool_sequence(
     teacher: Optional[OpenAICompatClient],
     q: str,
     ctx: str,
+    choices: Optional[Dict[str, str]] = None,
     planning_mode: str = "realistic",  # realistic | oracle
     reasoning_json: str = "",
     context_json: str = "",
@@ -1740,9 +2042,11 @@ def teacher_choose_tool_sequence(
         "Do not include any other keys.\n"
     )
 
+    choices_block = _format_choices_block(choices)
     if planning_mode == "oracle":
         user = (
             f"QUESTION:\n{q}\n\n"
+            f"{choices_block}"
             f"CONTEXT (truncated):\n{ctx[:2500]}\n\n"
             f"reasoning_tool output:\n{reasoning_json[:2000]}\n\n"
             f"context_tool output:\n{context_json[:2000]}\n"
@@ -1750,6 +2054,7 @@ def teacher_choose_tool_sequence(
     else:
         user = (
             f"QUESTION:\n{q}\n\n"
+            f"{choices_block}"
             f"CONTEXT (truncated):\n{ctx[:3000]}\n"
         )
 
@@ -1826,7 +2131,7 @@ def build_manager_sft_from_failures(
     teacher = get_teacher_client_from_env() if use_teacher else None
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = get_runtime_device()
 
     # Init tool agents (trained adapters; base must match tool SFT / adapter)
     init_tool_agents(tool_base_model, reasoning_adapter, context_adapter, device=device)
@@ -1864,6 +2169,7 @@ def build_manager_sft_from_failures(
             teacher=teacher,
             q=q,
             ctx=ctx,
+            choices=choices,
             planning_mode=planning_mode,
             reasoning_json=rj,
             context_json=cj,
@@ -1876,15 +2182,16 @@ def build_manager_sft_from_failures(
             sft_rows.append({"example_id": eid, "prompt": prompt1, "response": resp1})
             continue
 
-        resp1 = _tool_call_str(seq[0], eid)
+        call1_id = f"call_{eid}_1"
+        resp1 = _tool_call_message(seq[0], eid, call1_id)
         sft_rows.append({"example_id": eid, "prompt": prompt1, "response": resp1})
 
         # step 2 prompt: add tool output as tool message
         tool1_name = seq[0]
         tool1_out = rj if tool1_name == "reasoning_tool" else cj
         prompt2 = prompt1 + [
-            {"role": "assistant", "content": resp1},
-            {"role": "tool", "name": tool1_name, "content": tool1_out},
+            resp1,
+            {"role": "tool", "tool_call_id": call1_id, "name": tool1_name, "content": tool1_out},
         ]
 
         if len(seq) == 1:
@@ -1892,15 +2199,16 @@ def build_manager_sft_from_failures(
             sft_rows.append({"example_id": eid, "prompt": prompt2, "response": resp2})
             continue
 
-        resp2 = _tool_call_str(seq[1], eid)
+        call2_id = f"call_{eid}_2"
+        resp2 = _tool_call_message(seq[1], eid, call2_id)
         sft_rows.append({"example_id": eid, "prompt": prompt2, "response": resp2})
 
         # step 3 prompt: add tool2 output
         tool2_name = seq[1]
         tool2_out = rj if tool2_name == "reasoning_tool" else cj
         prompt3 = prompt2 + [
-            {"role": "assistant", "content": resp2},
-            {"role": "tool", "name": tool2_name, "content": tool2_out},
+            resp2,
+            {"role": "tool", "tool_call_id": call2_id, "name": tool2_name, "content": tool2_out},
         ]
         resp3 = _final_answer_str(gt)
         sft_rows.append({"example_id": eid, "prompt": prompt3, "response": resp3})
@@ -1930,8 +2238,10 @@ def train_manager_sft(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
 ):
+    require_datasets("train_manager_sft")
     set_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_runtime_device()
+    validate_distributed_runtime("train_manager_sft", require_cuda=(get_world_size() > 1))
 
     tok = AutoTokenizer.from_pretrained(manager_base_model, trust_remote_code=True)
     tok.padding_side = "left"
@@ -1942,12 +2252,12 @@ def train_manager_sft(
     except Exception:
         pass
 
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    dtype = get_runtime_dtype()
     model = AutoModelForCausalLM.from_pretrained(
         manager_base_model,
         torch_dtype=dtype,
         trust_remote_code=True,
-    ).to(device)
+    )
     model.config.use_cache = False
 
     if use_lora:
@@ -1984,7 +2294,7 @@ def train_manager_sft(
         num_train_epochs=epochs,
         logging_steps=10,
         save_strategy="epoch",
-        bf16=(device == "cuda"),
+        bf16=torch.cuda.is_available(),
         fp16=False,
         report_to=[],
         seed=seed,
@@ -2028,9 +2338,44 @@ def train_manager_grpo_from_splits(
     wandb_entity: str = "",
     wandb_run_name: str = "",
     wandb_mode: str = "online",  # online | offline
+    use_vllm: bool = False,
+    vllm_mode: str = "server",  # server | colocate
+    vllm_server_base_url: str = "http://127.0.0.1:8000",
+    vllm_gpu_memory_utilization: float = 0.35,
+    vllm_enable_sleep_mode: bool = False,
+    vllm_visible_devices: str = "",
+    vllm_tensor_parallel_size: int = 1,
 ):
+    require_datasets("train_manager_grpo")
+    require_trl("train_manager_grpo")
     set_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_runtime_device()
+    validate_distributed_runtime(
+        "train_manager_grpo",
+        require_cuda=(get_world_size() > 1 or use_vllm),
+        use_vllm=use_vllm,
+    )
+    if _IS_MAIN_PROCESS:
+        print(
+            f"[RUNTIME] platform={_platform_label()} world_size={get_world_size()} "
+            f"rank={get_global_rank()} local_rank={get_local_rank()} device={device}"
+        )
+        if use_vllm:
+            print(
+                f"[VLLM] enabled mode={vllm_mode} base_url={vllm_server_base_url} "
+                f"gpu_mem_util={float(vllm_gpu_memory_utilization):.2f}"
+            )
+            if vllm_mode == "server":
+                print(
+                    "[VLLM] launch hint: "
+                    + _build_vllm_server_launch_hint(
+                        model_name=manager_base_model,
+                        server_base_url=vllm_server_base_url,
+                        visible_devices=vllm_visible_devices,
+                        tensor_parallel_size=vllm_tensor_parallel_size,
+                        gpu_memory_utilization=vllm_gpu_memory_utilization,
+                    )
+                )
 
     rows = load_raw_pubmedqa(data_path)
     splits = read_json(split_path)
@@ -2116,45 +2461,64 @@ def train_manager_grpo_from_splits(
 
     train_dataset = dataset.map(preprocess, remove_columns=dataset.column_names)
 
+    grpo_kwargs = {
+        "output_dir": save_dir,
+        "remove_unused_columns": False,
+        "max_completion_length": int(max_completion_length),
+        "temperature": float(temperature),
+        "num_generations": int(num_generations),
+        "bf16": torch.cuda.is_available(),
+        "beta": float(grpo_beta),
+        "scale_rewards": "group",
+        "report_to": (["wandb"] if use_wandb else []),
+        "use_vllm": bool(use_vllm),
+        "per_device_train_batch_size": int(per_device_train_bs),
+        "max_tool_calling_iterations": 2,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "logging_steps": 1,
+        "log_completions": True,
+        "num_completions_to_print": None,
+        "log_unique_prompts": False,
+    }
+    if use_vllm:
+        grpo_kwargs.update(
+            {
+                "vllm_mode": vllm_mode,
+                "vllm_server_base_url": vllm_server_base_url,
+                "vllm_gpu_memory_utilization": float(vllm_gpu_memory_utilization),
+                "vllm_enable_sleep_mode": bool(vllm_enable_sleep_mode),
+            }
+        )
+
     grpo_args = GRPOConfig(
-        output_dir=save_dir,
-        remove_unused_columns=False,
-        max_completion_length=int(max_completion_length),
-        temperature=float(temperature),
-        num_generations=int(num_generations),
-        bf16=(device == "cuda"),
-        beta=float(grpo_beta),
-        scale_rewards="group",
-        report_to=(["wandb"] if use_wandb else []),
-        use_vllm=False,
-        per_device_train_batch_size=int(per_device_train_bs),
-        max_tool_calling_iterations=2,
-        chat_template_kwargs={"enable_thinking": False},
-        logging_steps=1,
-        log_completions=True,
-        num_completions_to_print=None,
-        log_unique_prompts=False,
+        **_filter_supported_kwargs(GRPOConfig.__init__, grpo_kwargs, "GRPOConfig")
     )
 
-    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    dtype = get_runtime_dtype()
     manager_model = AutoModelForCausalLM.from_pretrained(
         manager_base_model,
         torch_dtype=dtype,
         trust_remote_code=True,
     )
-    # .to(device)
     manager_model.config.use_cache = False
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
 
+    trainer_kwargs = {
+        "model": manager_model,
+        "args": grpo_args,
+        "train_dataset": train_dataset,
+        "reward_funcs": [binary_outcome_reward],
+        "rollout_func": None,
+    }
+    trainer_kwargs.update(_trainer_processing_kwargs(manager_tok))
+    if MANAGER_TOOL_BINDING_MODE == "environment":
+        trainer_kwargs["environment_factory"] = ManagerToolEnvironment
+    else:
+        trainer_kwargs["tools"] = [reasoning_tool, context_tool]
+
     trainer = GRPOTrainer(
-        model=manager_model,
-        args=grpo_args,
-        train_dataset=train_dataset,
-        processing_class=manager_tok,
-        tools=[reasoning_tool, context_tool],
-        reward_funcs=[binary_outcome_reward],
-        rollout_func=None,
+        **_filter_supported_kwargs(GRPOTrainer.__init__, trainer_kwargs, "GRPOTrainer")
     )
 
     trainer.train()
@@ -2228,6 +2592,13 @@ def main():
         help="Task preset. Controls default label space and manager prompt wording.",
     )
     parser.add_argument(
+        "--tool_binding_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "environment", "argument"],
+        help="How manager tools bind to the current example. `environment` avoids example_id hallucination.",
+    )
+    parser.add_argument(
         "--label_space",
         type=str,
         default="",
@@ -2283,6 +2654,23 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default="")
     parser.add_argument("--wandb_run_name", type=str, default="")
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline"])
+    parser.add_argument("--mgr_use_vllm", action="store_true")
+    parser.add_argument("--mgr_vllm_mode", type=str, default="server", choices=["server", "colocate"])
+    parser.add_argument("--mgr_vllm_server_base_url", type=str, default="http://127.0.0.1:8000")
+    parser.add_argument("--mgr_vllm_gpu_memory_utilization", type=float, default=0.35)
+    parser.add_argument("--mgr_vllm_enable_sleep_mode", action="store_true")
+    parser.add_argument(
+        "--mgr_vllm_visible_devices",
+        type=str,
+        default="",
+        help="Optional CUDA_VISIBLE_DEVICES string used only when printing the vLLM server launch hint.",
+    )
+    parser.add_argument(
+        "--mgr_vllm_tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Tensor parallel size used only when printing the vLLM server launch hint.",
+    )
 
     # evolve manager SFT
     parser.add_argument("--evolve_out_dir", type=str, default="evolve_manager_sft")
@@ -2300,6 +2688,7 @@ def main():
     parser.add_argument("--manager_sft_use_lora", action="store_true")
 
     args = parser.parse_args()
+    configure_cuda_runtime()
     if args.base_model.strip():
         shared = args.base_model.strip()
         args.manager_base_model = shared
@@ -2310,9 +2699,20 @@ def main():
     data_path = resolve_data_path_arg(args.data_path, configured_task)
     print(f"[DATA] data_path={data_path}")
     print(f"[MODELS] manager_base_model={args.manager_base_model} tool_base_model={args.tool_base_model}")
-    # Manager prompt depends on task/label configuration
-    global MANAGER_SYSTEM
+    binding_mode = (args.tool_binding_mode or "auto").strip().lower()
+    if binding_mode == "auto":
+        binding_mode = "environment" if _grpo_supports_environment_factory() else "argument"
+    if binding_mode == "environment" and not _grpo_supports_environment_factory():
+        raise RuntimeError(
+            "tool_binding_mode=environment requires a TRL version that supports `environment_factory`."
+        )
+    global MANAGER_TOOL_BINDING_MODE, MANAGER_SYSTEM
+    MANAGER_TOOL_BINDING_MODE = binding_mode
     MANAGER_SYSTEM = build_manager_system_prompt()
+    print(
+        f"[MANAGER_TOOLS] binding_mode={MANAGER_TOOL_BINDING_MODE} "
+        f"world_size={get_world_size()} local_rank={get_local_rank()} device={get_runtime_device()}"
+    )
     set_seed(args.seed)
 
     if args.stage == "make_splits":
@@ -2403,6 +2803,13 @@ def main():
             wandb_entity=args.wandb_entity,
             wandb_run_name=args.wandb_run_name,
             wandb_mode=args.wandb_mode,
+            use_vllm=args.mgr_use_vllm,
+            vllm_mode=args.mgr_vllm_mode,
+            vllm_server_base_url=args.mgr_vllm_server_base_url,
+            vllm_gpu_memory_utilization=args.mgr_vllm_gpu_memory_utilization,
+            vllm_enable_sleep_mode=args.mgr_vllm_enable_sleep_mode,
+            vllm_visible_devices=args.mgr_vllm_visible_devices,
+            vllm_tensor_parallel_size=args.mgr_vllm_tensor_parallel_size,
         )
         return
 
@@ -2470,6 +2877,13 @@ def main():
             wandb_entity=args.wandb_entity,
             wandb_run_name=args.wandb_run_name,
             wandb_mode=args.wandb_mode,
+            use_vllm=args.mgr_use_vllm,
+            vllm_mode=args.mgr_vllm_mode,
+            vllm_server_base_url=args.mgr_vllm_server_base_url,
+            vllm_gpu_memory_utilization=args.mgr_vllm_gpu_memory_utilization,
+            vllm_enable_sleep_mode=args.mgr_vllm_enable_sleep_mode,
+            vllm_visible_devices=args.mgr_vllm_visible_devices,
+            vllm_tensor_parallel_size=args.mgr_vllm_tensor_parallel_size,
         )
 
         build_manager_sft_from_failures(
