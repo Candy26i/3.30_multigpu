@@ -82,7 +82,7 @@ uv sync
 ## PyTorch (CUDA 12.8)
 
 ```bash
-uv pip uninstall -y torch torchvision torchaudio
+uv pip uninstall torch torchvision torchaudio
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
@@ -91,7 +91,7 @@ uv pip install torch torchvision torchaudio --index-url https://download.pytorch
 ## Transformers (>= 5.0.0.dev)
 
 ```bash
-uv pip uninstall -y transformers
+uv pip uninstall transformers
 uv pip install git+https://github.com/huggingface/transformers.git@main
 
 python -c "import transformers; print(transformers.__version__)"
@@ -105,7 +105,7 @@ Otherwise GRPO tool-calling will fail.
 ## TRL (>= 1.0.0.dev)
 
 ```bash
-uv pip uninstall -y trl
+uv pip uninstall trl
 uv pip install git+https://github.com/huggingface/trl.git
 
 python -c "import trl; print(trl.__version__)"
