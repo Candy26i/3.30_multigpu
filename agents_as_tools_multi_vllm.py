@@ -10,6 +10,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -207,6 +208,27 @@ def validate_distributed_runtime(stage_name: str, require_cuda: bool = False, us
             raise RuntimeError(
                 f"{stage_name} requested vLLM, but `vllm` is not importable in the current environment."
             )
+
+
+def validate_grpo_batch_geometry(
+    per_device_train_bs: int,
+    grad_accum: int,
+    num_generations: int,
+) -> None:
+    world_size = max(1, get_world_size())
+    effective_batch = int(per_device_train_bs) * world_size * int(grad_accum)
+    if effective_batch <= 0:
+        raise RuntimeError("GRPO effective batch size must be positive.")
+    if int(num_generations) <= 0:
+        raise RuntimeError("GRPO num_generations must be positive.")
+    if effective_batch % int(num_generations) != 0:
+        raise RuntimeError(
+            "Invalid GRPO batch geometry: "
+            f"per_device_train_batch_size({per_device_train_bs}) * world_size({world_size}) * "
+            f"gradient_accumulation_steps({grad_accum}) = {effective_batch}, "
+            f"which must be evenly divisible by num_generations({num_generations}). "
+            "This follows the TRL GRPO requirement for effective batch size."
+        )
 
 
 # =========================================================
@@ -1550,16 +1572,138 @@ class FrozenAgent:
         return self.tok.decode(gen, skip_special_tokens=True).strip()
 
 
-_reasoning_agent: Optional[FrozenAgent] = None
-_context_agent: Optional[FrozenAgent] = None
+@dataclass
+class SharedToolBase:
+    """One base model with multiple PEFT adapters, switched at generation time."""
+    tool_base_model: str
+    reasoning_adapter_path: Optional[str] = None
+    context_adapter_path: Optional[str] = None
+    device: str = "cpu"
+
+    def __post_init__(self):
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("SharedToolBase requires `peft`.")
+
+        self.tok = AutoTokenizer.from_pretrained(self.tool_base_model, trust_remote_code=True)
+        if self.tok.pad_token_id is None and self.tok.eos_token_id is not None:
+            self.tok.pad_token_id = self.tok.eos_token_id
+        self.tok.padding_side = "left"
+
+        dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.tool_base_model,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        ).to(self.device)
+
+        primary_name = None
+        primary_path = None
+        if self.reasoning_adapter_path:
+            primary_name = "reasoning_tool"
+            primary_path = self.reasoning_adapter_path
+        elif self.context_adapter_path:
+            primary_name = "context_tool"
+            primary_path = self.context_adapter_path
+
+        if primary_path is None:
+            raise RuntimeError("SharedToolBase requires at least one adapter path.")
+
+        model = PeftModel.from_pretrained(base_model, primary_path, adapter_name=primary_name).to(self.device)
+        self.adapter_names: Dict[str, Optional[str]] = {
+            "reasoning_tool": primary_name if self.reasoning_adapter_path == primary_path else None,
+            "context_tool": primary_name if self.context_adapter_path == primary_path else None,
+        }
+
+        if self.reasoning_adapter_path and self.reasoning_adapter_path != primary_path:
+            model.load_adapter(self.reasoning_adapter_path, adapter_name="reasoning_tool")
+            self.adapter_names["reasoning_tool"] = "reasoning_tool"
+        if self.context_adapter_path and self.context_adapter_path != primary_path:
+            model.load_adapter(self.context_adapter_path, adapter_name="context_tool")
+            self.adapter_names["context_tool"] = "context_tool"
+
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self.model = model
+        self.lock = threading.Lock()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        tool_name: str,
+        messages: List[Dict[str, str]],
+        max_new_tokens: int,
+        temperature: float = 0.0,
+    ) -> str:
+        adapter_name = self.adapter_names.get(tool_name)
+        if adapter_name is None:
+            raise RuntimeError(f"Adapter for tool `{tool_name}` is not loaded.")
+
+        prompt = render_chat_messages(self.tok, messages, add_generation_prompt=True)
+        inputs = self.tok(prompt, return_tensors="pt").to(self.device)
+        do_sample = (temperature > 1e-6)
+        gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": do_sample,
+            "pad_token_id": self.tok.pad_token_id,
+            "eos_token_id": self.tok.eos_token_id,
+        }
+        if do_sample:
+            gen_kwargs["temperature"] = max(temperature, 1e-6)
+
+        with self.lock:
+            self.model.set_adapter(adapter_name)
+            out = self.model.generate(**inputs, **gen_kwargs)
+        gen = out[0, inputs["input_ids"].shape[1]:]
+        return self.tok.decode(gen, skip_special_tokens=True).strip()
+
+
+@dataclass
+class SharedToolView:
+    shared_base: SharedToolBase
+    tool_name: str
+    max_new_tokens: int = 512
+
+    @torch.no_grad()
+    def generate(self, messages: List[Dict[str, str]], temperature: float = 0.0) -> str:
+        return self.shared_base.generate(
+            tool_name=self.tool_name,
+            messages=messages,
+            max_new_tokens=self.max_new_tokens,
+            temperature=temperature,
+        )
+
+
+_shared_tool_base: Optional[SharedToolBase] = None
+_reasoning_agent: Optional[Any] = None
+_context_agent: Optional[Any] = None
 
 
 def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapter: str, device: str):
-    global _reasoning_agent, _context_agent
+    global _shared_tool_base, _reasoning_agent, _context_agent
+    can_share = bool(PEFT_AVAILABLE and reasoning_adapter and context_adapter)
+
+    if can_share and _shared_tool_base is None:
+        try:
+            _shared_tool_base = SharedToolBase(
+                tool_base_model=tool_base_model,
+                reasoning_adapter_path=reasoning_adapter,
+                context_adapter_path=context_adapter,
+                device=device,
+            )
+            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=640)
+            _context_agent = SharedToolView(_shared_tool_base, "context_tool", max_new_tokens=400)
+            print("[TOOLS] runtime=shared_base adapters=reasoning_tool,context_tool")
+            return
+        except Exception as e:
+            print(f"[WARN] shared tool base init failed; falling back to split tool models. {type(e).__name__}: {e}")
+
     if _reasoning_agent is None:
         _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=640)
     if _context_agent is None:
         _context_agent = FrozenAgent(tool_base_model, context_adapter, device=device, max_new_tokens=400)
+    if _shared_tool_base is None:
+        print("[TOOLS] runtime=split_models")
 
 
 def _tool_guard(eid: int) -> Optional[str]:
@@ -2327,10 +2471,11 @@ def train_manager_grpo_from_splits(
     context_adapter: str,
     seed: int = 42,
     per_device_train_bs: int = 2,
+    grad_accum: int = 1,
     max_completion_length: int = 2048,
     temperature: float = 0.9,
     num_generations: int = 6,
-    grpo_beta: float = 0.01,
+    grpo_beta: float = 0.0,
     fail_buffer_jsonl: Optional[str] = None,
     raw_trace_jsonl: Optional[str] = None,
     use_wandb: bool = False,
@@ -2339,12 +2484,17 @@ def train_manager_grpo_from_splits(
     wandb_run_name: str = "",
     wandb_mode: str = "online",  # online | offline
     use_vllm: bool = False,
-    vllm_mode: str = "server",  # server | colocate
+    vllm_mode: str = "colocate",  # colocate | server
     vllm_server_base_url: str = "http://127.0.0.1:8000",
     vllm_gpu_memory_utilization: float = 0.35,
     vllm_enable_sleep_mode: bool = False,
     vllm_visible_devices: str = "",
     vllm_tensor_parallel_size: int = 1,
+    manager_use_lora: bool = False,
+    manager_lora_r: int = 8,
+    manager_lora_alpha: int = 16,
+    manager_lora_dropout: float = 0.05,
+    manager_gradient_checkpointing: bool = False,
 ):
     require_datasets("train_manager_grpo")
     require_trl("train_manager_grpo")
@@ -2354,6 +2504,11 @@ def train_manager_grpo_from_splits(
         "train_manager_grpo",
         require_cuda=(get_world_size() > 1 or use_vllm),
         use_vllm=use_vllm,
+    )
+    validate_grpo_batch_geometry(
+        per_device_train_bs=per_device_train_bs,
+        grad_accum=grad_accum,
+        num_generations=num_generations,
     )
     if _IS_MAIN_PROCESS:
         print(
@@ -2365,6 +2520,11 @@ def train_manager_grpo_from_splits(
                 f"[VLLM] enabled mode={vllm_mode} base_url={vllm_server_base_url} "
                 f"gpu_mem_util={float(vllm_gpu_memory_utilization):.2f}"
             )
+            if vllm_mode == "colocate" and (float(grpo_beta) > 0.0) and (not manager_use_lora):
+                print(
+                    "[WARN] colocate + full-finetune + grpo_beta>0 will load a reference model "
+                    "and often OOMs on 8B-class models. Prefer --grpo_beta 0.0 and --mgr_use_lora."
+                )
             if vllm_mode == "server":
                 print(
                     "[VLLM] launch hint: "
@@ -2464,6 +2624,7 @@ def train_manager_grpo_from_splits(
     grpo_kwargs = {
         "output_dir": save_dir,
         "remove_unused_columns": False,
+        "gradient_accumulation_steps": int(grad_accum),
         "max_completion_length": int(max_completion_length),
         "temperature": float(temperature),
         "num_generations": int(num_generations),
@@ -2475,6 +2636,7 @@ def train_manager_grpo_from_splits(
         "per_device_train_batch_size": int(per_device_train_bs),
         "max_tool_calling_iterations": 2,
         "chat_template_kwargs": {"enable_thinking": False},
+        "gradient_checkpointing": bool(manager_gradient_checkpointing),
         "logging_steps": 1,
         "log_completions": True,
         "num_completions_to_print": None,
@@ -2487,8 +2649,6 @@ def train_manager_grpo_from_splits(
                 "vllm_server_base_url": vllm_server_base_url,
                 "vllm_gpu_memory_utilization": float(vllm_gpu_memory_utilization),
                 "vllm_enable_sleep_mode": bool(vllm_enable_sleep_mode),
-                 "vllm_tensor_parallel_size": 2,
-            "vllm_max_model_len": 4096,
             }
         )
 
@@ -2505,6 +2665,38 @@ def train_manager_grpo_from_splits(
     manager_model.config.use_cache = False
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
+
+    if manager_use_lora:
+        if not PEFT_AVAILABLE:
+            raise RuntimeError("`--mgr_use_lora` requires `peft` to be installed.")
+        common = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        present = set([name.split(".")[-1] for name, _ in manager_model.named_modules()])
+        target_modules = [m for m in common if m in present]
+        if not target_modules:
+            target_modules = ["q_proj", "v_proj"]
+        lconf = LoraConfig(
+            r=manager_lora_r,
+            lora_alpha=manager_lora_alpha,
+            lora_dropout=manager_lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        manager_model = get_peft_model(manager_model, lconf)
+        print(f"[MANAGER LoRA] target_modules={target_modules}")
+
+    if manager_gradient_checkpointing:
+        try:
+            manager_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            manager_model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+        if hasattr(manager_model, "enable_input_require_grads"):
+            try:
+                manager_model.enable_input_require_grads()
+            except Exception:
+                pass
 
     trainer_kwargs = {
         "model": manager_model,
@@ -2645,10 +2837,16 @@ def main():
     # manager GRPO
     parser.add_argument("--manager_out", type=str, default="manager_grpo_binary")
     parser.add_argument("--mgr_bs", type=int, default=4)
+    parser.add_argument("--mgr_grad_accum", type=int, default=1)
     parser.add_argument("--mgr_max_completion_length", type=int, default=4096)
     parser.add_argument("--mgr_temperature", type=float, default=0.9)
-    parser.add_argument("--mgr_num_generations", type=int, default=6)
-    parser.add_argument("--grpo_beta", type=float, default=0.01)
+    parser.add_argument("--mgr_num_generations", type=int, default=4)
+    parser.add_argument(
+        "--grpo_beta",
+        type=float,
+        default=0.0,
+        help="KL coefficient. 0.0 avoids loading a GRPO reference model and saves substantial VRAM.",
+    )
     parser.add_argument("--fail_buffer_jsonl", type=str, default="")
     parser.add_argument("--raw_trace_jsonl", type=str, default="")
     parser.add_argument("--grpo_use_wandb", action="store_true")
@@ -2657,7 +2855,7 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default="")
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline"])
     parser.add_argument("--mgr_use_vllm", action="store_true")
-    parser.add_argument("--mgr_vllm_mode", type=str, default="server", choices=["server", "colocate"])
+    parser.add_argument("--mgr_vllm_mode", type=str, default="colocate", choices=["server", "colocate"])
     parser.add_argument("--mgr_vllm_server_base_url", type=str, default="http://127.0.0.1:8000")
     parser.add_argument("--mgr_vllm_gpu_memory_utilization", type=float, default=0.35)
     parser.add_argument("--mgr_vllm_enable_sleep_mode", action="store_true")
@@ -2673,6 +2871,11 @@ def main():
         default=1,
         help="Tensor parallel size used only when printing the vLLM server launch hint.",
     )
+    parser.add_argument("--mgr_use_lora", action="store_true")
+    parser.add_argument("--mgr_lora_r", type=int, default=8)
+    parser.add_argument("--mgr_lora_alpha", type=int, default=16)
+    parser.add_argument("--mgr_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--mgr_gradient_checkpointing", action="store_true")
 
     # evolve manager SFT
     parser.add_argument("--evolve_out_dir", type=str, default="evolve_manager_sft")
@@ -2794,6 +2997,7 @@ def main():
             context_adapter=args.context_tool_out,
             seed=args.seed,
             per_device_train_bs=args.mgr_bs,
+            grad_accum=args.mgr_grad_accum,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
             num_generations=args.mgr_num_generations,
@@ -2812,6 +3016,11 @@ def main():
             vllm_enable_sleep_mode=args.mgr_vllm_enable_sleep_mode,
             vllm_visible_devices=args.mgr_vllm_visible_devices,
             vllm_tensor_parallel_size=args.mgr_vllm_tensor_parallel_size,
+            manager_use_lora=args.mgr_use_lora,
+            manager_lora_r=args.mgr_lora_r,
+            manager_lora_alpha=args.mgr_lora_alpha,
+            manager_lora_dropout=args.mgr_lora_dropout,
+            manager_gradient_checkpointing=args.mgr_gradient_checkpointing,
         )
         return
 
@@ -2868,6 +3077,7 @@ def main():
             context_adapter=args.context_tool_out,
             seed=args.seed,
             per_device_train_bs=args.mgr_bs,
+            grad_accum=args.mgr_grad_accum,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
             num_generations=args.mgr_num_generations,
@@ -2886,6 +3096,11 @@ def main():
             vllm_enable_sleep_mode=args.mgr_vllm_enable_sleep_mode,
             vllm_visible_devices=args.mgr_vllm_visible_devices,
             vllm_tensor_parallel_size=args.mgr_vllm_tensor_parallel_size,
+            manager_use_lora=args.mgr_use_lora,
+            manager_lora_r=args.mgr_lora_r,
+            manager_lora_alpha=args.mgr_lora_alpha,
+            manager_lora_dropout=args.mgr_lora_dropout,
+            manager_gradient_checkpointing=args.mgr_gradient_checkpointing,
         )
 
         build_manager_sft_from_failures(
