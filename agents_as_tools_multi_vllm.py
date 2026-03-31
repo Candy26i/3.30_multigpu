@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 
 import numpy as np
 import torch
+import transformers
+from packaging.version import Version
 
 DATASETS_AVAILABLE = False
 DATASETS_IMPORT_ERROR: Optional[Exception] = None
@@ -151,6 +153,20 @@ def _grpo_supports_environment_factory() -> bool:
         return False
     supported = _signature_parameter_names(GRPOTrainer.__init__)
     return bool(supported and "environment_factory" in supported)
+
+
+def _get_transformers_version() -> str:
+    try:
+        return str(getattr(transformers, "__version__", "0"))
+    except Exception:
+        return "0"
+
+
+def _transformers_version_at_least(min_version: str) -> bool:
+    try:
+        return Version(_get_transformers_version()) >= Version(min_version)
+    except Exception:
+        return False
 
 
 def _trainer_processing_kwargs(processing_obj: Any) -> Dict[str, Any]:
@@ -2472,6 +2488,7 @@ def train_manager_grpo_from_splits(
     seed: int = 42,
     per_device_train_bs: int = 2,
     grad_accum: int = 1,
+    max_prompt_length: int = 2048,
     max_completion_length: int = 2048,
     temperature: float = 0.9,
     num_generations: int = 6,
@@ -2625,6 +2642,7 @@ def train_manager_grpo_from_splits(
         "output_dir": save_dir,
         "remove_unused_columns": False,
         "gradient_accumulation_steps": int(grad_accum),
+        "max_prompt_length": int(max_prompt_length),
         "max_completion_length": int(max_completion_length),
         "temperature": float(temperature),
         "num_generations": int(num_generations),
@@ -2790,7 +2808,7 @@ def main():
         type=str,
         default="auto",
         choices=["auto", "environment", "argument"],
-        help="How manager tools bind to the current example. `environment` avoids example_id hallucination.",
+        help="How manager tools bind to the current example. `environment` avoids example_id hallucination but requires transformers>=5.2.0.",
     )
     parser.add_argument(
         "--label_space",
@@ -2838,6 +2856,7 @@ def main():
     parser.add_argument("--manager_out", type=str, default="manager_grpo_binary")
     parser.add_argument("--mgr_bs", type=int, default=4)
     parser.add_argument("--mgr_grad_accum", type=int, default=1)
+    parser.add_argument("--mgr_max_prompt_length", type=int, default=2048)
     parser.add_argument("--mgr_max_completion_length", type=int, default=4096)
     parser.add_argument("--mgr_temperature", type=float, default=0.9)
     parser.add_argument("--mgr_num_generations", type=int, default=4)
@@ -2905,17 +2924,32 @@ def main():
     print(f"[DATA] data_path={data_path}")
     print(f"[MODELS] manager_base_model={args.manager_base_model} tool_base_model={args.tool_base_model}")
     binding_mode = (args.tool_binding_mode or "auto").strip().lower()
+    binding_decision = "explicit"
     if binding_mode == "auto":
-        binding_mode = "environment" if _grpo_supports_environment_factory() else "argument"
+        if _grpo_supports_environment_factory() and _transformers_version_at_least("5.2.0"):
+            binding_mode = "environment"
+            binding_decision = "auto(environment_factory supported and transformers>=5.2.0)"
+        else:
+            binding_mode = "argument"
+            if _grpo_supports_environment_factory():
+                binding_decision = "auto(transformers<5.2.0 -> argument)"
+            else:
+                binding_decision = "auto(environment_factory unsupported -> argument)"
     if binding_mode == "environment" and not _grpo_supports_environment_factory():
         raise RuntimeError(
             "tool_binding_mode=environment requires a TRL version that supports `environment_factory`."
+        )
+    if binding_mode == "environment" and not _transformers_version_at_least("5.2.0"):
+        raise RuntimeError(
+            "tool_binding_mode=environment requires transformers>=5.2.0 according to the TRL GRPO tool-calling docs. "
+            f"Current transformers version: {_get_transformers_version()}."
         )
     global MANAGER_TOOL_BINDING_MODE, MANAGER_SYSTEM
     MANAGER_TOOL_BINDING_MODE = binding_mode
     MANAGER_SYSTEM = build_manager_system_prompt()
     print(
-        f"[MANAGER_TOOLS] binding_mode={MANAGER_TOOL_BINDING_MODE} "
+        f"[MANAGER_TOOLS] binding_mode={MANAGER_TOOL_BINDING_MODE} decision={binding_decision} "
+        f"transformers={_get_transformers_version()} "
         f"world_size={get_world_size()} local_rank={get_local_rank()} device={get_runtime_device()}"
     )
     set_seed(args.seed)
@@ -2998,6 +3032,7 @@ def main():
             seed=args.seed,
             per_device_train_bs=args.mgr_bs,
             grad_accum=args.mgr_grad_accum,
+            max_prompt_length=args.mgr_max_prompt_length,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
             num_generations=args.mgr_num_generations,
@@ -3078,6 +3113,7 @@ def main():
             seed=args.seed,
             per_device_train_bs=args.mgr_bs,
             grad_accum=args.mgr_grad_accum,
+            max_prompt_length=args.mgr_max_prompt_length,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
             num_generations=args.mgr_num_generations,
