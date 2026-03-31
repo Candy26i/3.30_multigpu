@@ -2487,7 +2487,7 @@ def train_manager_grpo_from_splits(
                 "vllm_server_base_url": vllm_server_base_url,
                 "vllm_gpu_memory_utilization": float(vllm_gpu_memory_utilization),
                 "vllm_enable_sleep_mode": bool(vllm_enable_sleep_mode),
-                 "vllm_tensor_parallel_size": int(vllm_tensor_parallel_size),
+                 "vllm_tensor_parallel_size": 2,
             "vllm_max_model_len": 4096,
             }
         )
