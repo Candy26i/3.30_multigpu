@@ -2014,7 +2014,7 @@ class ManagerToolEnvironment:
         return context_tool(getattr(self, "example_id", -1))
 
 
-def build_manager_system_prompt() -> str:
+# def build_manager_system_prompt() -> str:
     if TASK_NAME == "medqa":
         task_line = "You are a manager agent solving medical multiple-choice questions."
     elif TASK_NAME == "pubmedqa":
@@ -2050,7 +2050,23 @@ def build_manager_system_prompt() -> str:
         "Do not write anything after that last line.\n"
         "Do NOT output <think>.\n"
     )
+def build_manager_system_prompt() -> str:
+    if TASK_NAME == "medqa":
+        task_line = "You are a manager agent solving medical multiple-choice questions."
+    elif TASK_NAME == "pubmedqa":
+        task_line = "You are a manager agent solving PubMedQA-style clinical questions."
+    else:
+        task_line = "You are a manager agent solving clinical QA tasks."
 
+    answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
+    return (
+        task_line + "\n"
+        "Calling tools is OPTIONAL.\n"
+        "You have up to TWO tool calls total.\n"
+        "- Final answer must end with exactly one line:\n"
+        f"{answer_lines}\n"
+        "Do not write anything after that last line.\n"
+    )
 
 MANAGER_SYSTEM = build_manager_system_prompt()
 
@@ -2065,7 +2081,7 @@ def _format_choices_block(choices: Optional[Dict[str, str]]) -> str:
     return f"Choices:\n{lines}\n\n"
 
 
-def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+# def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     choices_block = _format_choices_block(choices)
     if _manager_tools_require_example_id():
         tool_hint = "If you use a tool, call it with the current Example ID."
@@ -2082,6 +2098,30 @@ def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[st
                 f"Context:\n{ctx}\n\n"
                 f"{tool_hint}\n"
                 "If you do NOT call tools, answer directly.\n"
+            ),
+        },
+    ]
+def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+    choices_block = _format_choices_block(choices)
+    return [
+        {"role": "system", "content": MANAGER_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"example_id: {eid}\n\n"
+                f"Question:\n{q}\n\n"
+                f"{choices_block}"
+                f"Context:\n{ctx}\n\n"
+                "You may call reasoning_tool and/or context_tool.\n"
+                "If you call a tool, copy the exact example_id provided above into the arguments.\n"
+                "If you do NOT call tools, answer directly.\n\n"
+                "When calling a tool, output exactly in one or more blocks like these:\n"
+                "<tool_call>\n"
+                f'{{"name": "reasoning_tool", "arguments": {{"example_id": {eid}}}}}\n'
+                "</tool_call>\n\n"
+                "<tool_call>\n"
+                f'{{"name": "context_tool", "arguments": {{"example_id": {eid}}}}}\n'
+                "</tool_call>\n"
             ),
         },
     ]
