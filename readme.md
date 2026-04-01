@@ -84,6 +84,20 @@ uv sync
 ```bash
 uv pip uninstall torch torchvision torchaudio
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# vLLM GPU runtime is Linux-only in the official setup.
+# Install this in Linux or WSL2 with a CUDA-enabled Python environment.
+# Latest stable TRL on PyPI as of 2026-03-30.
+trl==0.29.1
+# Latest vLLM version documented by TRL's vLLM integration page as supported.
+vllm==0.17.0
+accelerate>=1.12.0
+datasets>=4.4.1
+peft>=0.18.1
+transformers
+wandb>=0.21.0
+
+
 ```
 
 ---
