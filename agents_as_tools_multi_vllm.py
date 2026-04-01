@@ -2015,41 +2015,41 @@ class ManagerToolEnvironment:
 
 
 # def build_manager_system_prompt() -> str:
-    if TASK_NAME == "medqa":
-        task_line = "You are a manager agent solving medical multiple-choice questions."
-    elif TASK_NAME == "pubmedqa":
-        task_line = "You are a manager agent solving PubMedQA-style clinical questions."
-    else:
-        task_line = "You are a manager agent solving clinical QA tasks."
+    # if TASK_NAME == "medqa":
+    #     task_line = "You are a manager agent solving medical multiple-choice questions."
+    # elif TASK_NAME == "pubmedqa":
+    #     task_line = "You are a manager agent solving PubMedQA-style clinical questions."
+    # else:
+    #     task_line = "You are a manager agent solving clinical QA tasks."
 
-    answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
-    if _manager_tools_require_example_id():
-        tool_binding_line = "The available native tools expect the current Example ID from the user message."
-        tool_arg_rule = "If you call a tool, pass the current Example ID exactly as shown in the user message."
-    else:
-        tool_binding_line = "The available native tools are already bound to the current example."
-        tool_arg_rule = "If you call a tool, do not invent arguments."
-    return (
-        task_line + "\n"
-        "Calling tools is OPTIONAL.\n"
-        "You have up to TWO tool calls total.\n"
-        "Use the model's native tool-calling interface when you want to call a tool.\n"
-        "The available native tools are `reasoning_tool` and `context_tool`.\n"
-        f"{tool_binding_line}\n\n"
-        "Policy:\n"
-        "- Prefer answering directly when you are confident.\n"
-        "- If uncertain, call ONE tool first.\n"
-        "- Only call the second tool if you are still uncertain after the first tool.\n"
-        "- Do not write tool calls, XML tags, or tool-call JSON in plain text.\n"
-        f"- {tool_arg_rule}\n\n"
-        "Rules:\n"
-        "- If you call a tool, do NOT output the final ANSWER_* label in the same assistant turn.\n"
-        "- After receiving tool output, you may call another tool OR answer.\n"
-        "- Final answer may include brief reasoning, but it must end with exactly one line:\n"
-        f"{answer_lines}\n"
-        "Do not write anything after that last line.\n"
-        "Do NOT output <think>.\n"
-    )
+    # answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
+    # if _manager_tools_require_example_id():
+    #     tool_binding_line = "The available native tools expect the current Example ID from the user message."
+    #     tool_arg_rule = "If you call a tool, pass the current Example ID exactly as shown in the user message."
+    # else:
+    #     tool_binding_line = "The available native tools are already bound to the current example."
+    #     tool_arg_rule = "If you call a tool, do not invent arguments."
+    # return (
+    #     task_line + "\n"
+    #     "Calling tools is OPTIONAL.\n"
+    #     "You have up to TWO tool calls total.\n"
+    #     "Use the model's native tool-calling interface when you want to call a tool.\n"
+    #     "The available native tools are `reasoning_tool` and `context_tool`.\n"
+    #     f"{tool_binding_line}\n\n"
+    #     "Policy:\n"
+    #     "- Prefer answering directly when you are confident.\n"
+    #     "- If uncertain, call ONE tool first.\n"
+    #     "- Only call the second tool if you are still uncertain after the first tool.\n"
+    #     "- Do not write tool calls, XML tags, or tool-call JSON in plain text.\n"
+    #     f"- {tool_arg_rule}\n\n"
+    #     "Rules:\n"
+    #     "- If you call a tool, do NOT output the final ANSWER_* label in the same assistant turn.\n"
+    #     "- After receiving tool output, you may call another tool OR answer.\n"
+    #     "- Final answer may include brief reasoning, but it must end with exactly one line:\n"
+    #     f"{answer_lines}\n"
+    #     "Do not write anything after that last line.\n"
+    #     "Do NOT output <think>.\n"
+    # )
 def build_manager_system_prompt() -> str:
     if TASK_NAME == "medqa":
         task_line = "You are a manager agent solving medical multiple-choice questions."
@@ -2082,25 +2082,25 @@ def _format_choices_block(choices: Optional[Dict[str, str]]) -> str:
 
 
 # def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
-    choices_block = _format_choices_block(choices)
-    if _manager_tools_require_example_id():
-        tool_hint = "If you use a tool, call it with the current Example ID."
-    else:
-        tool_hint = "If you use a tool, call the current-example tool directly."
-    return [
-        {"role": "system", "content": MANAGER_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"Example ID: {eid}\n\n"
-                f"Question:\n{q}\n\n"
-                f"{choices_block}"
-                f"Context:\n{ctx}\n\n"
-                f"{tool_hint}\n"
-                "If you do NOT call tools, answer directly.\n"
-            ),
-        },
-    ]
+    # choices_block = _format_choices_block(choices)
+    # if _manager_tools_require_example_id():
+    #     tool_hint = "If you use a tool, call it with the current Example ID."
+    # else:
+    #     tool_hint = "If you use a tool, call the current-example tool directly."
+    # return [
+    #     {"role": "system", "content": MANAGER_SYSTEM},
+    #     {
+    #         "role": "user",
+    #         "content": (
+    #             f"Example ID: {eid}\n\n"
+    #             f"Question:\n{q}\n\n"
+    #             f"{choices_block}"
+    #             f"Context:\n{ctx}\n\n"
+    #             f"{tool_hint}\n"
+    #             "If you do NOT call tools, answer directly.\n"
+    #         ),
+    #     },
+    # ]
 def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     choices_block = _format_choices_block(choices)
     return [
