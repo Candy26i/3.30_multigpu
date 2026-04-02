@@ -15,6 +15,9 @@ Model paths (pipeline with tools):
  share --pipeline_base_model_for_tools; override per tool with
  --pipeline_reasoning_base_model / --pipeline_context_base_model when you
  want different bases without loading a merged full dir for each tool.
+
+Manager + tools: prompts must match GRPOTrainer — same tool callables passed to
+apply_chat_template, optional TRL training chat template, and enable_thinking=False.
 """
 
 
@@ -35,6 +38,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 import agents_as_tools as m
+
+try:
+    from trl.chat_template_utils import add_response_schema, get_training_chat_template
+except Exception:  # optional; training uses TRL but keep eval import resilient
+    add_response_schema = None  # type: ignore[misc, assignment]
+    get_training_chat_template = None  # type: ignore[misc, assignment]
 
 
 
@@ -116,36 +125,93 @@ def load_lm(model_dir: str, device: str) -> Tuple[Any, Any]:
 
 
 
-def render_prompt(tok: Any, messages: List[Dict[str, Any]]) -> str:
-   try:
-       return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-   except TypeError:
-       return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-   except Exception:
-       flat = []
-       for mm in messages:
-           if mm.get("role") == "tool":
-               nm = mm.get("name", "tool")
-               ct = mm.get("content", "")
-               flat.append({"role": "user", "content": f"TOOL_OUTPUT {nm}:\n{ct}\n"})
-           else:
-               flat.append(mm)
+def augment_manager_tokenizer_for_tools(tok: Any) -> Tuple[Any, Optional[str]]:
+   """
+   Match GRPOTrainer setup: response schema for parsing / generation, and prefix-preserving
+   Qwen3 training template when TRL provides one.
+   """
+   chat_template_override: Optional[str] = None
+   if add_response_schema is not None:
        try:
-           return tok.apply_chat_template(flat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-       except TypeError:
+           tok = add_response_schema(tok)
+       except Exception:
+           pass
+   if get_training_chat_template is not None:
+       try:
+           chat_template_override = get_training_chat_template(tok)
+       except Exception:
+           chat_template_override = None
+   return tok, chat_template_override
+
+
+
+
+def render_prompt(
+   tok: Any,
+   messages: List[Dict[str, Any]],
+   *,
+   tools: Optional[List[Any]] = None,
+   chat_template: Optional[str] = None,
+) -> str:
+   """
+   Build prompt text. When tools is set, pass the same callables as GRPOTrainer so the Qwen3
+   template injects tool definitions (eval must match training).
+   """
+   extra_variants: List[Dict[str, Any]] = []
+   if chat_template is not None and tools is not None:
+       extra_variants.append({"tools": tools, "chat_template": chat_template})
+   if tools is not None:
+       extra_variants.append({"tools": tools})
+   extra_variants.append({})
+
+   for extra in extra_variants:
+       try:
+           try:
+               kw = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": False, **extra}
+               return tok.apply_chat_template(messages, **kw)
+           except TypeError:
+               kw = {"tokenize": False, "add_generation_prompt": True, **extra}
+               return tok.apply_chat_template(messages, **kw)
+       except Exception:
+           continue
+
+   flat: List[Dict[str, Any]] = []
+   for mm in messages:
+       if mm.get("role") == "tool":
+           nm = mm.get("name", "tool")
+           ct = mm.get("content", "")
+           flat.append({"role": "user", "content": f"TOOL_OUTPUT {nm}:\n{ct}\n"})
+       else:
+           flat.append(mm)
+   try:
+       return tok.apply_chat_template(flat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+   except TypeError:
+       try:
            return tok.apply_chat_template(flat, tokenize=False, add_generation_prompt=True)
        except Exception:
-           parts = []
-           for mm in flat:
-               parts.append(f"{mm.get('role','')}: {mm.get('content','')}")
-           return "\n".join(parts) + "\nassistant: "
+           pass
+   except Exception:
+       pass
+   parts = []
+   for mm in flat:
+       parts.append(f"{mm.get('role','')}: {mm.get('content','')}")
+   return "\n".join(parts) + "\nassistant: "
 
 
 
 
 @torch.no_grad()
-def generate_text(model: Any, tok: Any, messages: List[Dict[str, Any]], max_new_tokens: int, temperature: float) -> str:
-   prompt = render_prompt(tok, messages)
+def generate_text(
+   model: Any,
+   tok: Any,
+   messages: List[Dict[str, Any]],
+   max_new_tokens: int,
+   temperature: float,
+   *,
+   tools: Optional[List[Any]] = None,
+   chat_template: Optional[str] = None,
+) -> str:
+   prompt = render_prompt(tok, messages, tools=tools, chat_template=chat_template)
    inputs = tok(prompt, return_tensors="pt").to(model.device)
    out = model.generate(
        **inputs,
@@ -161,7 +227,32 @@ def generate_text(model: Any, tok: Any, messages: List[Dict[str, Any]], max_new_
 
 
 
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*", re.IGNORECASE | re.DOTALL)
+TOOL_CALL_CLOSE_RE = re.compile(r"</tool_call>", re.IGNORECASE | re.DOTALL)
+
+
+
+
+def _dict_from_tool_call_block(text: str) -> Optional[Dict[str, Any]]:
+   """Parse JSON inside the first <tool_call>...</tool_call> (handles nested arguments)."""
+   mo = TOOL_CALL_OPEN_RE.search(text)
+   if not mo:
+       return None
+   start = mo.end()
+   mc = TOOL_CALL_CLOSE_RE.search(text[start:])
+   if not mc:
+       return None
+   inner = text[start : start + mc.start()].strip()
+   if not inner:
+       return None
+   obj = m.extract_first_json(inner)
+   if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+       return obj
+   try:
+       obj2 = json.loads(inner)
+   except Exception:
+       return None
+   return obj2 if isinstance(obj2, dict) else None
 
 
 
@@ -169,14 +260,8 @@ TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 def parse_tool_call(text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
    if not text:
        return None
-   m1 = TOOL_CALL_RE.search(text)
-   if m1:
-       raw = m1.group(1)
-       try:
-           obj = json.loads(raw)
-       except Exception:
-           return None
-   else:
+   obj = _dict_from_tool_call_block(text)
+   if obj is None:
        obj = m.extract_first_json(text)
    if not isinstance(obj, dict):
        return None
@@ -388,14 +473,19 @@ def eval_manager_system(
    use_tools = bool(system.get("use_tools", True))
 
 
+   pipeline_tools: Optional[List[Any]] = None
+   manager_chat_template: Optional[str] = None
    if use_tools:
        init_tool_agents_for_system(system=system, device=device)
+       pipeline_tools = [m.reasoning_tool, m.context_tool]
    else:
        m._reasoning_agent = None
        m._context_agent = None
 
 
    tok, model = load_lm(manager_dir, device=device)
+   if use_tools:
+       tok, manager_chat_template = augment_manager_tokenizer_for_tools(tok)
 
 
    y_true: List[str] = []
@@ -423,6 +513,8 @@ def eval_manager_system(
                messages=messages,
                max_new_tokens=max_new_tokens,
                temperature=temperature,
+               tools=pipeline_tools,
+               chat_template=manager_chat_template,
            ).strip()
 
 
