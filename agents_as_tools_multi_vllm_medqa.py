@@ -2212,22 +2212,9 @@ def build_manager_system_prompt() -> str:
         task_line + "\n"
         "Calling tools is OPTIONAL.\n"
         "You have up to TWO tool calls total.\n"
-        "Use the model's native tool-calling interface when you want to call a tool.\n"
-        "The available native tools are `reasoning_tool` and `context_tool`.\n"
-        f"{tool_binding_line}\n\n"
-        "Policy:\n"
-        "- Prefer answering directly when you are confident.\n"
-        "- If uncertain, call ONE tool first.\n"
-        "- Only call the second tool if you are still uncertain after the first tool.\n"
-        "- Do not write tool calls, XML tags, or tool-call JSON in plain text.\n"
-        f"- {tool_arg_rule}\n\n"
-        "Rules:\n"
-        "- If you call a tool, do NOT output the final ANSWER_* label in the same assistant turn.\n"
-        "- After receiving tool output, you may call another tool OR answer.\n"
-        "- Final answer may include brief reasoning, but it must end with exactly one line:\n"
+        "- Final answer must end with exactly one line:\n"
         f"{answer_lines}\n"
         "Do not write anything after that last line.\n"
-        "Do NOT output <think>.\n"
     )
 
 
@@ -2240,25 +2227,28 @@ def _format_choices_block(choices: Optional[Dict[str, str]]) -> str:
 
 def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     choices_block = _format_choices_block(choices)
-    if _manager_tools_require_example_id():
-        tool_hint = "If you use a tool, call it with the current Example ID."
-    else:
-        tool_hint = "If you use a tool, call the current-example tool directly."
     return [
         {"role": "system", "content": MANAGER_SYSTEM},
         {
             "role": "user",
             "content": (
-                f"Example ID: {eid}\n\n"
+                f"example_id: {eid}\n\n"
                 f"Question:\n{q}\n\n"
                 f"{choices_block}"
                 f"Context:\n{ctx}\n\n"
-                f"{tool_hint}\n"
-                "If you do NOT call tools, answer directly.\n"
+                "You may call reasoning_tool and/or context_tool.\n"
+                "If you call a tool, copy the exact example_id provided above into the arguments.\n"
+                "If you do NOT call tools, answer directly.\n\n"
+                "When calling a tool, output exactly in one or more blocks like these:\n"
+                "<tool_call>\n"
+                f'{{"name": "reasoning_tool", "arguments": {{"example_id": {eid}}}}}\n'
+                "</tool_call>\n\n"
+                "<tool_call>\n"
+                f'{{"name": "context_tool", "arguments": {{"example_id": {eid}}}}}\n'
+                "</tool_call>\n"
             ),
         },
     ]
-
 
 # =========================================================
 # Binary outcome reward + failure logging (self-evolving)
