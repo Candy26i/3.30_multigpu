@@ -2059,7 +2059,7 @@ def build_manager_system_prompt() -> str:
         task_line = "You are a manager agent solving clinical QA tasks."
 
     answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
-   return (
+    return (
        task_line + "\n"
        "Calling tools is OPTIONAL.\n"
        "You have up to TWO tool calls total.\n"
