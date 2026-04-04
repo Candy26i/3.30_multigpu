@@ -2059,14 +2059,19 @@ def build_manager_system_prompt() -> str:
         task_line = "You are a manager agent solving clinical QA tasks."
 
     answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
-    return (
-        task_line + "\n"
-        "Calling tools is OPTIONAL.\n"
-        "You have up to TWO tool calls total.\n"
-        "- Final answer must end with exactly one line:\n"
-        f"{answer_lines}\n"
-        "Do not write anything after that last line.\n"
-    )
+   return (
+       task_line + "\n"
+       "Calling tools is OPTIONAL.\n"
+       "You have up to TWO tool calls total.\n"
+       "- Final answer must end with exactly one line:\n"
+       f"{answer_lines}\n"
+       "Prefer YES or NO whenever there is any reasonable evidence."
+       "Do not use MAYBE just because of uncertainty or incomplete info."
+       "Use MAYBE only if the question cannot be answered from the given information AND there is no evidence favoring either YES or NO."
+       "Do not write anything after that last line.\n"
+
+
+   )
 
 MANAGER_SYSTEM = build_manager_system_prompt()
 
