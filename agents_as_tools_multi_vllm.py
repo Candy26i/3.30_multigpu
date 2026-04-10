@@ -2704,6 +2704,7 @@ def train_manager_grpo_from_splits(
         "log_completions": True,
         "num_completions_to_print": None,
         "log_unique_prompts": False,
+        "do_sample": True,
     }
     if use_vllm:
         grpo_kwargs.update(
@@ -2726,6 +2727,10 @@ def train_manager_grpo_from_splits(
         trust_remote_code=True,
     )
     manager_model.config.use_cache = False
+    if getattr(manager_model, "generation_config", None) is not None:
+    manager_model.generation_config.do_sample = True
+    manager_model.generation_config.temperature = float(temperature)
+
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
 
