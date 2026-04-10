@@ -131,12 +131,6 @@ python agents_as_tools.py --stage train_tool_context --task_name pubmedqa --base
 
 ---
 
-## 3️⃣ Train Manager (GRPO)
-
-```bash
-python agents_as_tools.py --stage train_manager_grpo --task_name pubmedqa --base_model Qwen/Qwen3-0.6B --data_path pubmedqa --split_path splits_pubmedqa_500.json --reasoning_tool_out reasoning_lora_mvp_split --context_tool_out context_lora_mvp_split --manager_out manager_grpo_mvp_split --mgr_bs 8 --mgr_max_completion_length 512 --mgr_temperature 0.9 --mgr_num_generations 2 --grpo_beta 0.01 --fail_buffer_jsonl manager_grpo_mvp_split/fail_buffer.jsonl --raw_trace_jsonl manager_grpo_mvp_split/train_raw_trace.jsonl --seed 42
-```
-
 
 ## MULTIPLE GPU
 
