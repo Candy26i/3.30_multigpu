@@ -51,8 +51,8 @@ uv --version
 ## 2. Clone Repository
 
 ```bash
-git clone https://github.com/Candy26i/3_20_research.git
-cd 3_20_research
+git clone https://github.com/Candy26i/3_20_research.git](https://github.com/Candy26i/3.30_multigpu.git
+cd 3.30_research
 ```
 
 ---
