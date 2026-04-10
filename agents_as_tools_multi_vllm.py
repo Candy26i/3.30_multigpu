@@ -2728,8 +2728,8 @@ def train_manager_grpo_from_splits(
     )
     manager_model.config.use_cache = False
     if getattr(manager_model, "generation_config", None) is not None:
-    manager_model.generation_config.do_sample = True
-    manager_model.generation_config.temperature = float(temperature)
+        manager_model.generation_config.do_sample = True
+        manager_model.generation_config.temperature = float(temperature)
 
     if not hasattr(manager_model, "warnings_issued") or manager_model.warnings_issued is None:
         manager_model.warnings_issued = {}
