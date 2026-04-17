@@ -206,6 +206,9 @@ rm -r folder_name
 # 💡 Tips
 
 * Use `tmux` for long training jobs
+
+apt update
+apt install tmux -y
 * Save logs frequently (`jsonl`)
 * Push only results to GitHub (NOT models)
 
