@@ -1707,7 +1707,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
                 context_adapter_path=context_adapter,
                 device=device,
             )
-            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=640)
+            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=2000)
             _context_agent = SharedToolView(_shared_tool_base, "context_tool", max_new_tokens=400)
             print("[TOOLS] runtime=shared_base adapters=reasoning_tool,context_tool")
             return
@@ -1715,7 +1715,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
             print(f"[WARN] shared tool base init failed; falling back to split tool models. {type(e).__name__}: {e}")
 
     if _reasoning_agent is None:
-        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=640)
+        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=2000)
     if _context_agent is None:
         _context_agent = FrozenAgent(tool_base_model, context_adapter, device=device, max_new_tokens=400)
     if _shared_tool_base is None:
@@ -1806,18 +1806,18 @@ def reasoning_tool(example_id: int) -> str:
     """
     eid = int(example_id)
     guard = _tool_guard(eid)
-    if guard is not None:
-        REASONING_RAW_CACHE[eid] = guard
-        _append_raw_trace_rows([{
-            "ts": int(time.time()),
-            "agent": "reasoning_tool",
-            "event": "tool_call",
-            "example_id": eid,
-            "cache_hit": False,
-            "guard_error": True,
-            "raw_output": guard,
-        }])
-        return guard
+    # if guard is not None:
+    #     REASONING_RAW_CACHE[eid] = guard
+    #     _append_raw_trace_rows([{
+    #         "ts": int(time.time()),
+    #         "agent": "reasoning_tool",
+    #         "event": "tool_call",
+    #         "example_id": eid,
+    #         "cache_hit": False,
+    #         "guard_error": True,
+    #         "raw_output": guard,
+    #     }])
+    #     return guard
     if eid in REASONING_CACHE:
         raw_cached = REASONING_RAW_CACHE.get(eid, REASONING_CACHE[eid])
         _append_raw_trace_rows([{
