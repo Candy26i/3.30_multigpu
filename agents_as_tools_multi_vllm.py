@@ -1869,7 +1869,8 @@ def reasoning_tool(example_id: int) -> str:
     }])
     obj = extract_first_json(raw)
 
-    # if obj is None:
+    if obj is None:
+        return dumps_json({"error": "reasoning_tool output is not valid JSON object."})
     #     # Fallback without any label usage
     #     ev = [{"sid": int(c["sid"]), "text": c["text"][:240], "polarity": "unclear"} for c in candidates[:4]]
     #     obj = {
