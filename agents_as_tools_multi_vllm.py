@@ -1707,7 +1707,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
                 context_adapter_path=context_adapter,
                 device=device,
             )
-            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=640)
+            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=1001)
             _context_agent = SharedToolView(_shared_tool_base, "context_tool", max_new_tokens=400)
             print("[TOOLS] runtime=shared_base adapters=reasoning_tool,context_tool")
             return
@@ -1715,7 +1715,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
             print(f"[WARN] shared tool base init failed; falling back to split tool models. {type(e).__name__}: {e}")
 
     if _reasoning_agent is None:
-        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=640)
+        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=1001)
     if _context_agent is None:
         _context_agent = FrozenAgent(tool_base_model, context_adapter, device=device, max_new_tokens=400)
     if _shared_tool_base is None:
