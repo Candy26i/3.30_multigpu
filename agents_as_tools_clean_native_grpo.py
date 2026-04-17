@@ -9,7 +9,7 @@ Design choices:
 2) fixed argument-based tools only (example_id is always passed)
 3) explicit generation config for manager sampling
 4) reward shaping for final correctness + valid tool use
-5) lightweight planner prompt with subgoal / memory / uncertainty guidance
+5) explicit planner-state loop with lightweight subgoal / memory entries
 
 Recommended environment:
   transformers >= 4.53
@@ -1414,15 +1414,15 @@ def context_tool(example_id: int) -> str:
 
 
 # =========================
-# Manager prompt: lightweight subgoal + memory
+# Manager prompt: explicit planner-state loop + lightweight memory
 # =========================
 def build_manager_system_prompt() -> str:
     if TASK_NAME == "medqa":
-        task_line = "You are a planner-manager agent solving medical multiple-choice questions."
+        task_line = "You are a manager agent solving medical multiple-choice questions."
     elif TASK_NAME == "pubmedqa":
-        task_line = "You are a planner-manager agent solving PubMedQA-style clinical questions."
+        task_line = "You are a manager agent solving PubMedQA-style clinical questions."
     else:
-        task_line = "You are a planner-manager agent solving clinical QA tasks."
+        task_line = "You are a manager agent solving clinical QA tasks."
 
     answer_lines = "\n".join([f"  ANSWER_{ANSWER_CANONICAL_TO_TOKEN[lab]}" for lab in ANSWER_LABELS])
     return (
@@ -1431,13 +1431,23 @@ def build_manager_system_prompt() -> str:
         "Available tools: reasoning_tool, context_tool.\n"
         "Tool arguments: always pass the exact current example_id from the user message.\n"
         f"You may make up to {MAX_MANAGER_TOOL_CALLS} tool calls total.\n\n"
-        "Planning policy:\n"
-        "- First form a brief internal plan around current uncertainty.\n"
-        "- If direct answering is reliable, answer directly.\n"
+        "At every assistant turn, BEFORE any native tool call or final answer, you must write a compact planner-state block in plain text using exactly this format:\n"
+        "[ManagerState]\n"
+        "Sub-Goal: <one short sentence>\n"
+        "Use-Tool: <reasoning_tool|context_tool|none>\n"
+        "Memory:\n"
+        "- Known: <what is already established from previous steps>\n"
+        "- Remaining: <what is still uncertain>\n"
+        "- Next: <what this turn should accomplish>\n"
+        "[/PlannerState]\n\n"
+        "Manager policy:\n"
+        "- The PlannerState block is the explicit short-term memory for the current turn.\n"
+        "- On the first turn, Memory should start from the initial question and no-tool state.\n"
+        "- After a tool result, update Memory to summarize what that tool established.\n"
+        "- If direct answering is reliable, set Use-Tool: none and answer directly.\n"
         "- If uncertain, call ONE tool first.\n"
         "- Call the second tool only if uncertainty remains after reading the first tool result.\n"
-        "- Use previous tool outputs as memory of what is already known; do not repeat the same tool call unless needed.\n"
-        "- Prefer concise progress updates over long free-form reasoning.\n"
+        "- Do not repeat the same tool call unless the memory shows a real unresolved gap.\n"
         "- Do not write XML tags, tool-call JSON, or pseudo-tool calls in plain text.\n\n"
         "If you answer, the final line must be exactly one of:\n"
         f"{answer_lines}\n"
@@ -1457,6 +1467,15 @@ def _format_choices_block(choices: Optional[Dict[str, str]]) -> str:
     return "Choices:\n" + "\n".join([f"{k}. {v}" for k, v in items]) + "\n\n"
 
 
+def _initial_memory_block() -> str:
+    return (
+        "Current Planner Memory:\n"
+        "- Known: no tool outputs yet\n"
+        "- Remaining: answer label is unresolved\n"
+        f"- Tool budget: up to {MAX_MANAGER_TOOL_CALLS} total tool calls\n"
+    )
+
+
 def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     choices_block = _format_choices_block(choices)
     user_text = (
@@ -1464,8 +1483,10 @@ def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[st
         f"Question:\n{q}\n\n"
         f"{choices_block}"
         f"Context:\n{ctx}\n\n"
+        f"{_initial_memory_block()}\n"
         "Decide the next best action. Use native tool call if needed.\n"
         "When you call a tool, pass the exact Example ID shown above as the only argument.\n"
+        "After every tool result, treat the tool output as new evidence and update PlannerState.Memory in the next assistant turn.\n"
     )
     return [
         {"role": "system", "content": MANAGER_SYSTEM},
@@ -1474,8 +1495,81 @@ def build_manager_messages(eid: int, q: str, ctx: str, choices: Optional[Dict[st
 
 
 # =========================
-# Reward shaping
+# Reward shaping + planner-state validation
 # =========================
+PLANNER_STATE_RE = re.compile(
+    r"\[PlannerState\]\s*"
+    r"Sub-Goal:\s*(?P<subgoal>.*?)\s*"
+    r"Use-Tool:\s*(?P<use_tool>.*?)\s*"
+    r"Memory:\s*"
+    r"- Known:\s*(?P<known>.*?)\s*"
+    r"- Remaining:\s*(?P<remaining>.*?)\s*"
+    r"- Next:\s*(?P<next>.*?)\s*"
+    r"\[/PlannerState\]",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_planner_state(text: str) -> Optional[Dict[str, str]]:
+    if not text:
+        return None
+    m = PLANNER_STATE_RE.search(str(text))
+    if not m:
+        return None
+    out = {k: " ".join(str(v).strip().split()) for k, v in m.groupdict().items()}
+    return out
+
+
+def count_valid_planner_states(assistant_texts: List[str]) -> Tuple[int, List[Dict[str, str]]]:
+    parsed: List[Dict[str, str]] = []
+    valid = 0
+    for txt in assistant_texts:
+        st = parse_planner_state(txt)
+        if st is None:
+            continue
+        # require non-empty and sane use_tool
+        if (
+            st["subgoal"]
+            and st["known"]
+            and st["remaining"]
+            and st["next"]
+            and st["use_tool"] in {"reasoning_tool", "context_tool", "none"}
+        ):
+            valid += 1
+            parsed.append(st)
+    return valid, parsed
+
+
+def repeated_tool_call_penalty(tool_names: List[str], tool_payloads: List[str]) -> float:
+    seen = set()
+    penalty = 0.0
+    for name, payload in zip(tool_names, tool_payloads):
+        key = (str(name).strip(), " ".join(str(payload).split()))
+        if key in seen:
+            penalty -= 0.10
+        else:
+            seen.add(key)
+    return penalty
+
+
+def memory_progress_bonus(planner_states: List[Dict[str, str]]) -> float:
+    if len(planner_states) <= 1:
+        return 0.0
+    bonus = 0.0
+    prev_known = None
+    prev_remaining = None
+    for st in planner_states:
+        known = st["known"]
+        remaining = st["remaining"]
+        if prev_known is not None and known != prev_known:
+            bonus += 0.03
+        if prev_remaining is not None and remaining != prev_remaining:
+            bonus += 0.03
+        prev_known = known
+        prev_remaining = remaining
+    return min(0.12, bonus)
+
+
 def shaped_manager_reward(prompts=None, completions=None, ground_truth=None, example_id=None, **kwargs):
     n = len(completions)
     gts = ensure_list(ground_truth, n)
@@ -1496,19 +1590,35 @@ def shaped_manager_reward(prompts=None, completions=None, ground_truth=None, exa
         fake_tool_text = bool(st["fake_tool_text_attempt"])
         tool_call_count = int(st["tool_call_count"])
 
+        planner_state_count, planner_states = count_valid_planner_states(st.get("assistant_texts", []))
+        has_planner_state = planner_state_count > 0
+        repeated_penalty = repeated_tool_call_penalty(st.get("tool_names", []), st.get("tool_payloads", []))
+        progress_bonus = memory_progress_bonus(planner_states)
+
         reward = 0.0
         if valid_format:
-            reward += 0.1
+            reward += 0.10
+        if has_planner_state:
+            reward += 0.10
+            reward += 0.05 * float(min(planner_state_count, 2))
+        else:
+            reward -= 0.10
+
         if tool_call_count > 0:
             reward += 0.05
         if 0 < tool_call_count <= MAX_MANAGER_TOOL_CALLS:
             reward += 0.05
         if tool_call_count > MAX_MANAGER_TOOL_CALLS:
             reward -= 0.15 * float(tool_call_count - MAX_MANAGER_TOOL_CALLS)
+
+        reward += repeated_penalty
+        reward += progress_bonus
+
         if final_has_artifacts:
             reward -= 0.25
         if fake_tool_text:
             reward -= 0.35
+
         if valid_format and (pred == gt):
             reward += 1.0
             if tool_call_count > 0:
@@ -1530,6 +1640,10 @@ def shaped_manager_reward(prompts=None, completions=None, ground_truth=None, exa
             "valid_format": bool(valid_format),
             "tool_call_count": tool_call_count,
             "tool_names": st.get("tool_names", []),
+            "planner_state_count": planner_state_count,
+            "planner_states": planner_states,
+            "memory_progress_bonus": progress_bonus,
+            "repeated_tool_penalty": repeated_penalty,
             "final_has_tool_artifacts": bool(final_has_artifacts),
             "fake_tool_text_attempt": bool(fake_tool_text),
             "assistant_texts": st.get("assistant_texts", []),
@@ -1600,7 +1714,7 @@ def train_manager_grpo_from_splits(
     per_device_train_bs: int = 8,
     grad_accum: int = 1,
     max_prompt_length: int = 2048,
-    max_completion_length: int = 4096,
+    max_completion_length: int = 512,
     temperature: float = 0.5,
     num_generations: int = 8,
     grpo_beta: float = 0.001,
