@@ -152,6 +152,15 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --config_file accelerate_configs/trl_
 │   ├── fail_buffer.jsonl
 │   └── train_raw_trace.jsonl
 ```
+# Evaluation
+```
+python evaluate_pipeline_vs_baselines.py --task_name pubmedqa --data_path pubmedqa --split_path splits_pubmedqa_500.json --split_key test_ids --max_eval_samples 0 --pipeline_manager_dir manager_grpo_binary_no_vllm --pipeline_base_model_for_tools Qwen/Qwen3-8B --pipeline_reasoning_adapter reasoning_lora_mvp_split --pipeline_context_adapter context_lora_mvp_split --add_pipeline_no_tools_baseline --baseline_model_dirs "Qwen/Qwen3-8B" --baseline_model_names "qwen3_base_direct" --add_random_baseline --add_majority_baseline --temperature 0.0 --max_new_tokens 4000 --max_tool_calls 2 --out_dir eval_pubmedqa_compare
+
+```
+
+
+
+
 
 ---
 
