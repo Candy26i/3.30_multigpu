@@ -1707,7 +1707,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
                 context_adapter_path=context_adapter,
                 device=device,
             )
-            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=2000)
+            _reasoning_agent = SharedToolView(_shared_tool_base, "reasoning_tool", max_new_tokens=640)
             _context_agent = SharedToolView(_shared_tool_base, "context_tool", max_new_tokens=400)
             print("[TOOLS] runtime=shared_base adapters=reasoning_tool,context_tool")
             return
@@ -1715,7 +1715,7 @@ def init_tool_agents(tool_base_model: str, reasoning_adapter: str, context_adapt
             print(f"[WARN] shared tool base init failed; falling back to split tool models. {type(e).__name__}: {e}")
 
     if _reasoning_agent is None:
-        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=2000)
+        _reasoning_agent = FrozenAgent(tool_base_model, reasoning_adapter, device=device, max_new_tokens=640)
     if _context_agent is None:
         _context_agent = FrozenAgent(tool_base_model, context_adapter, device=device, max_new_tokens=400)
     if _shared_tool_base is None:
@@ -1887,6 +1887,15 @@ def reasoning_tool(example_id: int) -> str:
     # obj = _normalize_reasoning_output(obj)
     out = dumps_json(obj)
     REASONING_CACHE[eid] = out
+    raw = _reasoning_agent.generate(msgs, temperature=0.0) if _reasoning_agent else ""
+    REASONING_RAW_CACHE[eid] = raw
+
+    # 加这两行临时调试
+    print(f"[DEBUG reasoning_tool] eid={eid} raw_len={len(raw)}")
+    print(f"[DEBUG reasoning_tool] raw=\n{raw[:500]}")
+
+    obj = extract_first_json(raw)
+    print(f"[DEBUG reasoning_tool] obj={obj}")
     return out
 
 
@@ -1972,6 +1981,15 @@ def context_tool(example_id: int) -> str:
     #     }
 
     # obj = _normalize_context_output(obj)
+    raw = _reasoning_agent.generate(msgs, temperature=0.0) if _reasoning_agent else ""
+    CONTEXT_RAW_CACHE[eid] = raw
+
+    # 加这两行临时调试
+    print(f"[DEBUG context_tool] eid={eid} raw_len={len(raw)}")
+    print(f"[DEBUG context_tool] raw=\n{raw[:500]}")
+
+    obj = extract_first_json(raw)
+    print(f"[DEBUG context_tool] obj={obj}")
     out = dumps_json(obj)
     CONTEXT_CACHE[eid] = out
     return out
