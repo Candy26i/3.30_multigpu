@@ -1728,71 +1728,71 @@ def _tool_guard(eid: int) -> Optional[str]:
     return None
 
 
-def _normalize_reasoning_output(obj: Dict[str, Any]) -> Dict[str, Any]:
-    ev = obj.get("evidence", [])
-    if not isinstance(ev, list):
-        ev = []
-    norm_ev = []
-    for it in ev[:6]:
-        if isinstance(it, dict):
-            sid_raw = it.get("sid", -1)
-            sid = int(sid_raw) if str(sid_raw).lstrip("-").isdigit() else -1
-            txt = str(it.get("text", ""))[:240]
-            pol = str(it.get("polarity", "unclear"))
-            if pol not in ["support", "oppose", "unclear"]:
-                pol = "unclear"
-            norm_ev.append({"sid": sid, "text": txt, "polarity": pol})
-    obj["evidence"] = norm_ev
+# def _normalize_reasoning_output(obj: Dict[str, Any]) -> Dict[str, Any]:
+#     ev = obj.get("evidence", [])
+#     if not isinstance(ev, list):
+#         ev = []
+#     norm_ev = []
+#     for it in ev[:6]:
+#         if isinstance(it, dict):
+#             sid_raw = it.get("sid", -1)
+#             sid = int(sid_raw) if str(sid_raw).lstrip("-").isdigit() else -1
+#             txt = str(it.get("text", ""))[:240]
+#             pol = str(it.get("polarity", "unclear"))
+#             if pol not in ["support", "oppose", "unclear"]:
+#                 pol = "unclear"
+#             norm_ev.append({"sid": sid, "text": txt, "polarity": pol})
+#     obj["evidence"] = norm_ev
 
-    if not isinstance(obj.get("reasoning_steps"), list):
-        obj["reasoning_steps"] = []
-    obj["reasoning_steps"] = [str(x)[:180] for x in obj["reasoning_steps"][:5]]
+#     if not isinstance(obj.get("reasoning_steps"), list):
+#         obj["reasoning_steps"] = []
+#     obj["reasoning_steps"] = [str(x)[:180] for x in obj["reasoning_steps"][:5]]
 
-    if not isinstance(obj.get("counterpoints"), list):
-        obj["counterpoints"] = []
-    obj["counterpoints"] = [str(x)[:180] for x in obj["counterpoints"][:3]]
+#     if not isinstance(obj.get("counterpoints"), list):
+#         obj["counterpoints"] = []
+#     obj["counterpoints"] = [str(x)[:180] for x in obj["counterpoints"][:3]]
 
-    uf = obj.get("uncertainty_flags", [])
-    if not isinstance(uf, list):
-        uf = []
-    obj["uncertainty_flags"] = [str(x)[:120] for x in uf[:3]]
+#     uf = obj.get("uncertainty_flags", [])
+#     if not isinstance(uf, list):
+#         uf = []
+#     obj["uncertainty_flags"] = [str(x)[:120] for x in uf[:3]]
 
-    try:
-        obj["confidence"] = float(obj.get("confidence", 0.6))
-    except Exception:
-        obj["confidence"] = 0.6
-    obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
-    return obj
+#     try:
+#         obj["confidence"] = float(obj.get("confidence", 0.6))
+#     except Exception:
+#         obj["confidence"] = 0.6
+#     obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
+#     return obj
 
 
-def _normalize_context_output(obj: Dict[str, Any]) -> Dict[str, Any]:
-    ks = obj.get("key_sentences", [])
-    if not isinstance(ks, list):
-        ks = []
-    norm_ks = []
-    for it in ks[:6]:
-        if isinstance(it, dict):
-            sid_raw = it.get("sid", -1)
-            sid = int(sid_raw) if str(sid_raw).lstrip("-").isdigit() else -1
-            txt = str(it.get("text", ""))[:240]
-            norm_ks.append({"sid": sid, "text": txt})
-    obj["key_sentences"] = norm_ks
+# # def _normalize_context_output(obj: Dict[str, Any]) -> Dict[str, Any]:
+#     ks = obj.get("key_sentences", [])
+#     if not isinstance(ks, list):
+#         ks = []
+#     norm_ks = []
+#     for it in ks[:6]:
+#         if isinstance(it, dict):
+#             sid_raw = it.get("sid", -1)
+#             sid = int(sid_raw) if str(sid_raw).lstrip("-").isdigit() else -1
+#             txt = str(it.get("text", ""))[:240]
+#             norm_ks.append({"sid": sid, "text": txt})
+#     obj["key_sentences"] = norm_ks
 
-    if not isinstance(obj.get("context_summary"), str):
-        obj["context_summary"] = ""
-    obj["context_summary"] = obj["context_summary"][:260]
+#     if not isinstance(obj.get("context_summary"), str):
+#         obj["context_summary"] = ""
+#     obj["context_summary"] = obj["context_summary"][:260]
 
-    uf = obj.get("uncertainty_flags", [])
-    if not isinstance(uf, list):
-        uf = []
-    obj["uncertainty_flags"] = [str(x)[:120] for x in uf[:3]]
+#     uf = obj.get("uncertainty_flags", [])
+#     if not isinstance(uf, list):
+#         uf = []
+#     obj["uncertainty_flags"] = [str(x)[:120] for x in uf[:3]]
 
-    try:
-        obj["confidence"] = float(obj.get("confidence", 0.6))
-    except Exception:
-        obj["confidence"] = 0.6
-    obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
-    return obj
+#     try:
+#         obj["confidence"] = float(obj.get("confidence", 0.6))
+#     except Exception:
+#         obj["confidence"] = 0.6
+#     obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
+#     return obj
 
 
 def reasoning_tool(example_id: int) -> str:
@@ -1869,22 +1869,22 @@ def reasoning_tool(example_id: int) -> str:
     }])
     obj = extract_first_json(raw)
 
-    if obj is None:
-        # Fallback without any label usage
-        ev = [{"sid": int(c["sid"]), "text": c["text"][:240], "polarity": "unclear"} for c in candidates[:4]]
-        obj = {
-            "evidence": ev,
-            "reasoning_steps": [
-                f"Restate the question focus: {q[:120]}",
-                "Scan evidence for study design, endpoints, and direction of effect.",
-                "Note limitations and indirectness.",
-            ],
-            "counterpoints": ["Evidence may be indirect or underpowered."],
-            "uncertainty_flags": WEAK_UNCERTAINTY_FLAGS[:3],
-            "confidence": 0.6,
-        }
+    # if obj is None:
+    #     # Fallback without any label usage
+    #     ev = [{"sid": int(c["sid"]), "text": c["text"][:240], "polarity": "unclear"} for c in candidates[:4]]
+    #     obj = {
+    #         "evidence": ev,
+    #         "reasoning_steps": [
+    #             f"Restate the question focus: {q[:120]}",
+    #             "Scan evidence for study design, endpoints, and direction of effect.",
+    #             "Note limitations and indirectness.",
+    #         ],
+    #         "counterpoints": ["Evidence may be indirect or underpowered."],
+    #         "uncertainty_flags": WEAK_UNCERTAINTY_FLAGS[:3],
+    #         "confidence": 0.6,
+    #     }
 
-    obj = _normalize_reasoning_output(obj)
+    # obj = _normalize_reasoning_output(obj)
     out = dumps_json(obj)
     REASONING_CACHE[eid] = out
     return out
@@ -1960,18 +1960,18 @@ def context_tool(example_id: int) -> str:
     }])
     obj = extract_first_json(raw)
 
-    if obj is None:
-        rng = random.Random(67890 + eid)
-        candidates = build_candidates(q, ctx, top_k=20, rng=rng)
-        key_sentences = [{"sid": int(c["sid"]), "text": str(c["text"])[:240]} for c in candidates[:6]]
-        obj = {
-            "key_sentences": key_sentences,
-            "context_summary": "Decision-relevant signals extracted from context.",
-            "uncertainty_flags": WEAK_UNCERTAINTY_FLAGS[:3],
-            "confidence": 0.6,
-        }
+    # if obj is None:
+    #     rng = random.Random(67890 + eid)
+    #     candidates = build_candidates(q, ctx, top_k=20, rng=rng)
+    #     key_sentences = [{"sid": int(c["sid"]), "text": str(c["text"])[:240]} for c in candidates[:6]]
+    #     obj = {
+    #         "key_sentences": key_sentences,
+    #         "context_summary": "Decision-relevant signals extracted from context.",
+    #         "uncertainty_flags": WEAK_UNCERTAINTY_FLAGS[:3],
+    #         "confidence": 0.6,
+    #     }
 
-    obj = _normalize_context_output(obj)
+    # obj = _normalize_context_output(obj)
     out = dumps_json(obj)
     CONTEXT_CACHE[eid] = out
     return out
